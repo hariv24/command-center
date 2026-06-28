@@ -25,6 +25,15 @@ TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 TOGETHER_BASE_URL = "https://api.together.xyz/v1"
 
 
+def _groq_clients():
+    clients = []
+    for var in ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3"]:
+        key = os.getenv(var)
+        if key:
+            clients.append(AsyncGroq(api_key=key))
+    return clients
+
+
 def _together_client():
     key = os.getenv("TOGETHER_API_KEY")
     if not key:
@@ -37,14 +46,17 @@ def _together_client():
 
 
 async def _llm(groq_client, model, messages, max_tokens, temperature=0.7):
-    """Call Groq; on 429 fall back to Together.ai then Groq fast model."""
-    try:
-        r = await groq_client.chat.completions.create(
-            model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
-        )
-        return r.choices[0].message.content
-    except Exception as e:
-        if "rate_limit_exceeded" not in str(e):
+    """Try all Groq keys, then Together.ai, then Groq fast model."""
+    clients = _groq_clients() or [groq_client]
+    for client in clients:
+        try:
+            r = await client.chat.completions.create(
+                model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
+            )
+            return r.choices[0].message.content
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e):
+                continue
             raise
     together = _together_client()
     if together:
@@ -55,8 +67,7 @@ async def _llm(groq_client, model, messages, max_tokens, temperature=0.7):
             return r.choices[0].message.content
         except Exception:
             pass
-    # Last resort — Groq fast model
-    r = await groq_client.chat.completions.create(
+    r = await clients[0].chat.completions.create(
         model=MODEL_FAST, messages=messages, max_tokens=max_tokens, temperature=temperature
     )
     return r.choices[0].message.content
@@ -315,7 +326,7 @@ Write a long-form intelligence brief section. Structure:
 
 Make this comprehensive. A reader should fully understand this story and its implications from this section alone. Do not summarize. Explain."""
 
-    return await _llm(client, MODEL_FAST, [{"role": "user", "content": prompt}], max_tokens=900)
+    return await _llm(client, MODEL_HEAVY, [{"role": "user", "content": prompt}], max_tokens=1000)
 
 
 async def generate_board_verdict(client, story_map, profile):

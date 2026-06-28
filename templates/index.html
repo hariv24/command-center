@@ -559,7 +559,19 @@ select option{background:var(--s2)}
     <div class="rline" id="bdroute"></div>
     <div class="agrid" id="bdgrid"></div>
     <div class="synth"><div class="slabel">Synthesis</div><div class="synth-body" id="bdsynth"></div></div>
-    <div style="margin-top:9px"><button class="btn bg sm" onclick="openSaveDec()">Save as Decision</button></div>
+    <div style="margin-top:9px;display:flex;gap:8px">
+      <button class="btn bg sm" onclick="openSaveDec()">Save as Decision</button>
+    </div>
+    <!-- Follow-up thread -->
+    <div id="bd-thread"></div>
+    <div id="bd-followup" style="margin-top:18px">
+      <div class="slabel" style="margin-bottom:8px;font-size:9px">Follow up</div>
+      <div style="display:flex;gap:8px">
+        <input id="bd-fu-input" type="text" placeholder="Push back, go deeper, ask about a specific part..." style="flex:1;background:var(--s2);border:1px solid var(--bdr);color:var(--t1);padding:9px 12px;font-size:13px;font-family:var(--ff);outline:none">
+        <button class="btn btn-m sm" id="bd-fu-btn" onclick="submitFollowup()">Ask</button>
+      </div>
+      <div class="err" id="bd-fu-err"></div>
+    </div>
   </div>
 </div>
 
@@ -921,16 +933,19 @@ async function loadRecs(){
 }
 async function actionRec(id){await fetch(`/api/recommendations/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status:'actioned'})});loadRecs();initHome();}
 
+let boardConversation=[];
+
 async function runBoard(){
   const q=document.getElementById('qin').value.trim();if(!q)return;
   const b=document.getElementById('bdb');b.disabled=true;b.textContent='Convening...';
   document.getElementById('bdspin').classList.add('on');document.getElementById('bdr').style.display='none';document.getElementById('bderr').classList.remove('on');
   try{
     const d=await post('/api/board',{question:q});if(d.error)throw new Error(d.error);
-    curSessId=d.session_id;renderBoard(d);
+    curSessId=d.session_id;boardConversation=[];renderBoard(d);
   }catch(e){const el=document.getElementById('bderr');el.textContent='Error: '+e.message;el.classList.add('on');}
   finally{b.disabled=false;b.textContent='Convene the Board';document.getElementById('bdspin').classList.remove('on');}
 }
+
 function renderBoard(d){
   document.getElementById('bdmeta').textContent=`Session ${d.session_id} · ${new Date(d.timestamp).toLocaleString()}`;
   document.getElementById('bdq').textContent=d.question;
@@ -945,12 +960,55 @@ function renderBoard(d){
       <div class="atxt">${esc(r.response)}</div>
     </div>`).join('');
   document.getElementById('bdsynth').innerHTML=marked.parse(d.synthesis);
+  document.getElementById('bd-thread').innerHTML='';
+  document.getElementById('bd-fu-input').value='';
+  document.getElementById('bd-fu-err').classList.remove('on');
   document.getElementById('bdr').style.display='block';
   document.getElementById('bdr').scrollIntoView({behavior:'smooth',block:'start'});
+  // Store first exchange
+  boardConversation.push({question:d.question,synthesis:d.synthesis,responses:d.responses});
   loadRecs();
 }
+
+function _boardAdvisorCards(responses){
+  return responses.map(r=>`
+    <div class="acard" style="border-left-color:${r.color}">
+      <div class="acard-head">${advPhoto(r.name)}<div><div class="aname" style="color:${r.color}">${r.name}</div><div class="arole">${r.role}</div></div></div>
+      <div class="atxt">${esc(r.response)}</div>
+    </div>`).join('');
+}
+
+async function submitFollowup(){
+  const q=document.getElementById('bd-fu-input').value.trim();if(!q)return;
+  const btn=document.getElementById('bd-fu-btn');
+  btn.disabled=true;btn.textContent='...';
+  document.getElementById('bd-fu-err').classList.remove('on');
+  // Build context from all prior turns
+  const ctx=boardConversation.map((t,i)=>
+    `[Turn ${i+1}] Question: ${t.question}\nSynthesis: ${t.synthesis}`
+  ).join('\n\n');
+  const fullQ=`CONVERSATION CONTEXT (this is a follow-up in an ongoing board session):\n${ctx}\n\nFOLLOW-UP: ${q}\n\n(Continue advising. Reference what was said earlier if relevant. Don't re-introduce yourself.)`;
+  try{
+    const d=await post('/api/board',{question:fullQ});if(d.error)throw new Error(d.error);
+    boardConversation.push({question:q,synthesis:d.synthesis,responses:d.responses});
+    const thread=document.getElementById('bd-thread');
+    const turn=document.createElement('div');
+    turn.style.cssText='margin-top:22px;border-top:1px solid var(--bdr);padding-top:18px';
+    turn.innerHTML=`
+      <div class="qbanner" style="margin-bottom:10px">${esc(q)}</div>
+      <div class="agrid">${_boardAdvisorCards(d.responses)}</div>
+      <div class="synth"><div class="slabel">Synthesis</div><div class="synth-body">${marked.parse(d.synthesis)}</div></div>`;
+    thread.appendChild(turn);
+    document.getElementById('bd-fu-input').value='';
+    turn.scrollIntoView({behavior:'smooth',block:'start'});
+  }catch(e){
+    const el=document.getElementById('bd-fu-err');el.textContent='Error: '+e.message;el.classList.add('on');
+  }finally{btn.disabled=false;btn.textContent='Ask';}
+}
+
 function openSaveDec(){go('decisions',document.querySelectorAll('.si')[4]);document.getElementById('dc').value=document.getElementById('bdsynth').textContent.slice(0,250);document.getElementById('dd').focus();}
 document.getElementById('qin').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')runBoard()});
+document.getElementById('bd-fu-input').addEventListener('keydown',e=>{if(e.key==='Enter')submitFollowup()});
 
 async function loadConvictions(){
   const cvs=await fetch('/api/convictions').then(r=>r.json()).catch(()=>[]);
