@@ -188,6 +188,7 @@ select option{background:var(--s2)}
 .aname{font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:2px}
 .arole{font-size:10px;color:var(--t3)}
 .atxt{font-size:13px;line-height:1.75;color:var(--t2);white-space:pre-wrap}
+.bd-turn{margin-top:24px}.bd-turn-divider{display:flex;align-items:center;gap:10px;margin-bottom:14px}.bd-turn-line{flex:1;height:1px;background:var(--h2)}.bd-turn-label{font-family:var(--fm);font-size:8px;font-weight:700;letter-spacing:2.5px;color:var(--t3);text-transform:uppercase;white-space:nowrap}
 .synth{background:var(--s2);border:1px solid var(--h1);padding:20px}
 .synth-body{font-size:13.5px;line-height:1.85;color:var(--t2)}
 .synth-body h2{font-size:12px;color:var(--t1);margin:14px 0 5px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px}
@@ -565,9 +566,15 @@ select option{background:var(--s2)}
     <!-- Follow-up thread -->
     <div id="bd-thread"></div>
     <div id="bd-followup" style="margin-top:18px">
+      <div id="bd-target-row" style="display:none;margin-bottom:9px;align-items:center;gap:10px">
+        <span style="font-size:8px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--t3);font-family:var(--fm);white-space:nowrap">ADDRESS</span>
+        <select id="bd-target-adv" style="background:var(--s2);border:1px solid var(--h2);color:var(--t2);padding:5px 10px;font-size:10px;font-family:var(--fm);font-weight:700;letter-spacing:1.5px;outline:none;cursor:pointer;text-transform:uppercase">
+          <option value="">THE BOARD</option>
+        </select>
+      </div>
       <div class="slabel" style="margin-bottom:8px;font-size:9px">Follow up</div>
       <div style="display:flex;gap:8px">
-        <input id="bd-fu-input" type="text" placeholder="Push back, go deeper, ask about a specific part..." style="flex:1;background:var(--s2);border:1px solid var(--bdr);color:var(--t1);padding:9px 12px;font-size:13px;font-family:var(--ff);outline:none">
+        <input id="bd-fu-input" type="text" placeholder="Push back, go deeper, or pick one advisor above..." style="flex:1;background:var(--s2);border:1px solid var(--bdr);color:var(--t1);padding:9px 12px;font-size:13px;font-family:var(--ff);outline:none">
         <button class="btn btn-m sm" id="bd-fu-btn" onclick="submitFollowup()">Ask</button>
       </div>
       <div class="err" id="bd-fu-err"></div>
@@ -946,31 +953,7 @@ async function runBoard(){
   finally{b.disabled=false;b.textContent='Convene the Board';document.getElementById('bdspin').classList.remove('on');}
 }
 
-function renderBoard(d){
-  document.getElementById('bdmeta').textContent=`Session ${d.session_id} · ${new Date(d.timestamp).toLocaleString()}`;
-  document.getElementById('bdq').textContent=d.question;
-  const names=d.responses.map(r=>r.name);
-  const skip=Object.keys(AC).filter(n=>!names.includes(n));
-  document.getElementById('bdroute').innerHTML='<span style="letter-spacing:2px;margin-right:5px">ROUTED TO:</span>'+
-    names.map(n=>`<span class="rb" style="color:${(AC[n]||{}).color||'#888'};border-color:${(AC[n]||{}).color||'#888'}44">${n}</span>`).join('')+
-    (skip.length?`<span style="opacity:.3">${skip.length} not convened</span>`:'');
-  document.getElementById('bdgrid').innerHTML=d.responses.map(r=>`
-    <div class="acard" style="border-left-color:${r.color}">
-      <div class="acard-head">${advPhoto(r.name)}<div><div class="aname" style="color:${r.color}">${r.name}</div><div class="arole">${r.role}</div></div></div>
-      <div class="atxt">${esc(r.response)}</div>
-    </div>`).join('');
-  document.getElementById('bdsynth').innerHTML=marked.parse(d.synthesis);
-  document.getElementById('bd-thread').innerHTML='';
-  document.getElementById('bd-fu-input').value='';
-  document.getElementById('bd-fu-err').classList.remove('on');
-  document.getElementById('bdr').style.display='block';
-  document.getElementById('bdr').scrollIntoView({behavior:'smooth',block:'start'});
-  // Store first exchange
-  boardConversation.push({question:d.question,synthesis:d.synthesis,responses:d.responses});
-  loadRecs();
-}
-
-function _boardAdvisorCards(responses){
+function _advisorCards(responses){
   return responses.map(r=>`
     <div class="acard" style="border-left-color:${r.color}">
       <div class="acard-head">${advPhoto(r.name)}<div><div class="aname" style="color:${r.color}">${r.name}</div><div class="arole">${r.role}</div></div></div>
@@ -978,29 +961,82 @@ function _boardAdvisorCards(responses){
     </div>`).join('');
 }
 
+function _populateTargetAdvisorSelect(advisorNames){
+  const sel=document.getElementById('bd-target-adv');
+  sel.innerHTML='<option value="">THE BOARD</option>';
+  (advisorNames||[]).forEach(name=>{
+    const opt=document.createElement('option');
+    opt.value=name;
+    opt.textContent=name.split(' ').slice(-1)[0].toUpperCase(); // MUNGER, DALIO etc.
+    sel.appendChild(opt);
+  });
+  document.getElementById('bd-target-row').style.display='flex';
+}
+
+function appendTurnToThread(turn, turnNum){
+  const thread=document.getElementById('bd-thread');
+  const el=document.createElement('div');
+  el.className='bd-turn';
+  const label=turn.target_advisor
+    ? `TURN ${turnNum} — TO ${turn.target_advisor.split(' ').slice(-1)[0].toUpperCase()}`
+    : `TURN ${turnNum}`;
+  const synthBlock=turn.synthesis
+    ? `<div class="synth" style="margin-top:10px"><div class="slabel">Synthesis</div><div class="synth-body">${marked.parse(turn.synthesis)}</div></div>`
+    : '';
+  el.innerHTML=`
+    <div class="bd-turn-divider"><div class="bd-turn-line"></div><span class="bd-turn-label">${label}</span><div class="bd-turn-line"></div></div>
+    <div class="qbanner" style="margin-bottom:10px">${esc(turn.question)}</div>
+    <div class="agrid">${_advisorCards(turn.responses)}</div>
+    ${synthBlock}`;
+  thread.appendChild(el);
+  el.scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+function renderBoard(d){
+  document.getElementById('bdmeta').textContent=`Session ${d.session_id} · ${new Date(d.timestamp).toLocaleString()}`;
+  document.getElementById('bdq').textContent=d.question;
+  const names=d.responses.map(r=>r.name);
+  const reasons=d.advisor_reasons||{};
+  const skip=Object.keys(AC).filter(n=>!names.includes(n));
+  document.getElementById('bdroute').innerHTML='<span style="letter-spacing:2px;margin-right:5px">ROUTED TO:</span>'+
+    names.map(n=>{
+      const reason=reasons[n]?`<div style="font-size:8px;color:var(--t3);margin-top:1px">${esc(reasons[n])}</div>`:'';
+      return`<span class="rb" style="color:${(AC[n]||{}).color||'#888'};border-color:${(AC[n]||{}).color||'#888'}44;display:inline-flex;flex-direction:column;padding:4px 8px">${n}${reason}</span>`;
+    }).join('')+
+    (skip.length?`<span style="opacity:.3">${skip.length} not convened</span>`:'');
+  document.getElementById('bdgrid').innerHTML=_advisorCards(d.responses);
+  document.getElementById('bdsynth').innerHTML=marked.parse(d.synthesis||'');
+  document.getElementById('bd-thread').innerHTML='';
+  document.getElementById('bd-fu-input').value='';
+  document.getElementById('bd-fu-err').classList.remove('on');
+  document.getElementById('bdr').style.display='block';
+  document.getElementById('bdr').scrollIntoView({behavior:'smooth',block:'start'});
+  boardConversation=[{question:d.question,synthesis:d.synthesis,responses:d.responses,target_advisor:null}];
+  // Replay additional turns if loading a multi-turn session from history
+  if(d.turns&&d.turns.length>1){
+    d.turns.slice(1).forEach((turn,i)=>{
+      boardConversation.push({question:turn.question,synthesis:turn.synthesis,responses:turn.responses,target_advisor:turn.target_advisor});
+      appendTurnToThread(turn,i+2);
+    });
+  }
+  const sessionAdvisors=d.advisors&&d.advisors.length?d.advisors:names;
+  _populateTargetAdvisorSelect(sessionAdvisors);
+  loadRecs();
+}
+
 async function submitFollowup(){
-  const q=document.getElementById('bd-fu-input').value.trim();if(!q)return;
+  const q=document.getElementById('bd-fu-input').value.trim();if(!q||!curSessId)return;
   const btn=document.getElementById('bd-fu-btn');
   btn.disabled=true;btn.textContent='...';
   document.getElementById('bd-fu-err').classList.remove('on');
-  // Build context from all prior turns
-  const ctx=boardConversation.map((t,i)=>
-    `[Turn ${i+1}] Question: ${t.question}\nSynthesis: ${t.synthesis}`
-  ).join('\n\n');
-  const fullQ=`CONVERSATION CONTEXT (this is a follow-up in an ongoing board session):\n${ctx}\n\nFOLLOW-UP: ${q}\n\n(Continue advising. Reference what was said earlier if relevant. Don't re-introduce yourself.)`;
+  const targetAdvisor=document.getElementById('bd-target-adv').value||null;
   try{
-    const d=await post('/api/board',{question:fullQ});if(d.error)throw new Error(d.error);
-    boardConversation.push({question:q,synthesis:d.synthesis,responses:d.responses});
-    const thread=document.getElementById('bd-thread');
-    const turn=document.createElement('div');
-    turn.style.cssText='margin-top:22px;border-top:1px solid var(--bdr);padding-top:18px';
-    turn.innerHTML=`
-      <div class="qbanner" style="margin-bottom:10px">${esc(q)}</div>
-      <div class="agrid">${_boardAdvisorCards(d.responses)}</div>
-      <div class="synth"><div class="slabel">Synthesis</div><div class="synth-body">${marked.parse(d.synthesis)}</div></div>`;
-    thread.appendChild(turn);
+    const d=await post(`/api/board/${curSessId}/followup`,{question:q,advisor:targetAdvisor||undefined});
+    if(d.error)throw new Error(d.error);
+    boardConversation.push({question:q,synthesis:d.turn.synthesis,responses:d.turn.responses,target_advisor:targetAdvisor});
+    appendTurnToThread(d.turn,boardConversation.length);
     document.getElementById('bd-fu-input').value='';
-    turn.scrollIntoView({behavior:'smooth',block:'start'});
+    document.getElementById('bd-target-adv').value='';
   }catch(e){
     const el=document.getElementById('bd-fu-err');el.textContent='Error: '+e.message;el.classList.add('on');
   }finally{btn.disabled=false;btn.textContent='Ask';}

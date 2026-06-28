@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent))
-from board import run_board, list_sessions, get_session, get_quick_response, _load_recs, _save_recs
+from board import run_board, list_sessions, get_session, get_quick_response, _load_recs, _save_recs, run_followup_async
 from tools.daily_brief import run_daily_brief_async
 
 app = Flask(__name__)
@@ -201,6 +201,23 @@ def board():
         wellness_append = f"\n\nHariv's current wellness state: {wb['content']}" if wb.get("content") else ""
         result = run_board(question + wellness_append if wellness_append else question)
         return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": _friendly_error(e)}), 500
+
+
+@app.route("/api/board/<session_id>/followup", methods=["POST"])
+@requires_auth
+def board_followup(session_id):
+    data = request.get_json()
+    question = data.get("question", "").strip()
+    target_advisor = data.get("advisor") or None
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+    try:
+        result = asyncio.run(run_followup_async(session_id, question, target_advisor))
+        return jsonify(result)
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 404
     except Exception as e:
         return jsonify({"error": _friendly_error(e)}), 500
 

@@ -25,8 +25,17 @@ TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
 TOGETHER_BASE_URL = "https://api.together.xyz/v1"
 
 
+def _groq_clients():
+    """Return all configured Groq clients (primary + any backup keys)."""
+    clients = []
+    for var in ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3"]:
+        key = os.getenv(var)
+        if key:
+            clients.append(AsyncGroq(api_key=key))
+    return clients
+
+
 def _make_together_client():
-    """Return an OpenAI-compatible client pointed at Together.ai, or None if not configured."""
     key = os.getenv("TOGETHER_API_KEY")
     if not key:
         return None
@@ -39,19 +48,22 @@ def _make_together_client():
 
 async def _call_with_fallback(primary_client, primary_model, messages, max_tokens, temperature):
     """
-    Try Groq first. On 429, fall back to Together.ai (same quality, separate limit).
-    Falls back to Groq's fast 8b model if Together is also unavailable.
+    Try all Groq keys in order, then Together.ai, then Groq fast model.
     """
-    try:
-        r = await primary_client.chat.completions.create(
-            model=primary_model, messages=messages,
-            max_tokens=max_tokens, temperature=temperature
-        )
-        return r.choices[0].message.content
-    except Exception as e:
-        if "rate_limit_exceeded" not in str(e):
+    clients = _groq_clients()
+    # Try each Groq key
+    for client in clients:
+        try:
+            r = await client.chat.completions.create(
+                model=primary_model, messages=messages,
+                max_tokens=max_tokens, temperature=temperature
+            )
+            return r.choices[0].message.content
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e):
+                continue
             raise
-    # Groq 429 — try Together.ai
+    # All Groq keys exhausted — try Together.ai
     together = _make_together_client()
     if together:
         try:
@@ -62,9 +74,9 @@ async def _call_with_fallback(primary_client, primary_model, messages, max_token
             return r.choices[0].message.content
         except Exception:
             pass
-    # Last resort — Groq fast model
+    # Last resort — Groq fast model on first key
     try:
-        r = await primary_client.chat.completions.create(
+        r = await clients[0].chat.completions.create(
             model=ROUTER_MODEL, messages=messages,
             max_tokens=max_tokens, temperature=temperature
         )
@@ -573,17 +585,31 @@ def load_knowledge_base():
     return ""
 
 
-def save_session(question, responses, synthesis):
+def save_session(question, responses, synthesis, advisors=None, advisor_reasons=None):
     SESSIONS_DIR.mkdir(exist_ok=True)
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    flat_responses = [
+        {"name": name, "role": role, "color": color, "response": response}
+        for name, role, color, response in responses
+    ]
+    turn_1 = {
+        "turn": 1,
+        "timestamp": datetime.now().isoformat(),
+        "question": question,
+        "target_advisor": None,
+        "responses": flat_responses,
+        "synthesis": synthesis
+    }
     data = {
         "id": session_id,
         "timestamp": datetime.now().isoformat(),
+        "schema_version": 2,
         "question": question,
-        "responses": [
-            {"name": name, "role": role, "color": color, "response": response}
-            for name, role, color, response in responses
-        ],
+        "advisors": advisors or [r[0] for r in responses],
+        "advisor_reasons": advisor_reasons or {},
+        "turns": [turn_1],
+        # Flat fields kept for backward compat
+        "responses": flat_responses,
         "synthesis": synthesis
     }
     (SESSIONS_DIR / f"{session_id}.json").write_text(json.dumps(data, indent=2))
@@ -661,10 +687,133 @@ Synthesize — under 250 words, 3 sections:
     )
 
 
+def _build_history_context(prior_turns):
+    """Compact structured summary of all prior turns for follow-up prompts."""
+    if not prior_turns:
+        return ""
+    parts = []
+    for t in prior_turns:
+        parts.append(f"[Turn {t['turn']}] Question: {t['question']}")
+        for r in t.get("responses", []):
+            preview = r["response"][:200].rstrip()
+            if len(r["response"]) > 200:
+                preview += "..."
+            parts.append(f"  {r['name']}: {preview}")
+        if t.get("synthesis"):
+            synth = t["synthesis"][:250].rstrip()
+            if len(t["synthesis"]) > 250:
+                synth += "..."
+            parts.append(f"  [Synthesis: {synth}]")
+        parts.append("")
+    return "\n".join(parts)
+
+
+async def _get_advisor_followup_response(client, name, config, question, profile, kb, history_context):
+    kb_section = f"\n\n## Accumulated context:\n{kb}" if kb else ""
+    history_section = f"\n\n## What has already been said in this meeting:\n{history_context}" if history_context else ""
+    prompt = f"""## The person you are advising:
+{profile}{kb_section}{history_section}
+
+## This is a FOLLOW-UP in an ongoing board meeting. Do NOT re-introduce yourself. Build on what was said.
+## Their follow-up:
+{question}
+
+Respond as {name}. Reference specific points from earlier if relevant. Challenge where thinking is still weak. Under 300 words."""
+
+    content = await _call_with_fallback(
+        client, MODEL,
+        messages=[{"role": "system", "content": config["system"]}, {"role": "user", "content": prompt}],
+        max_tokens=600, temperature=0.9
+    )
+    return name, config["role"], config["color"], content
+
+
+async def run_followup_async(session_id, question, target_advisor=None):
+    """Append a follow-up turn to an existing board session. Advisors stay locked."""
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise ValueError("GROQ_API_KEY not set")
+
+    session = get_session(session_id)
+    if not session:
+        raise ValueError(f"Session {session_id} not found")
+
+    # Get locked advisors — fall back to response names for old sessions
+    locked = session.get("advisors") or [r["name"] for r in session.get("responses", [])]
+    if not locked:
+        raise ValueError("Session has no advisors")
+
+    if target_advisor:
+        if target_advisor not in BOARD:
+            raise ValueError(f"Unknown advisor: {target_advisor}")
+        advisors_for_turn = [target_advisor]
+    else:
+        advisors_for_turn = locked
+
+    profile = load_profile()
+    kb = load_knowledge_base()
+
+    # Inject live context
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        import app as _app
+        live_ctx = _app._build_live_context()
+        if live_ctx:
+            kb = (kb or "") + f"\n\n[LIVE CONTEXT — {datetime.now().strftime('%Y-%m-%d')}]\n{live_ctx}"
+    except Exception:
+        pass
+
+    client = AsyncGroq(api_key=api_key)
+    prior_turns = session.get("turns", [])
+    history_context = _build_history_context(prior_turns)
+
+    tasks = [
+        _get_advisor_followup_response(client, name, BOARD[name], question, profile, kb, history_context)
+        for name in advisors_for_turn if name in BOARD
+    ]
+    responses = await asyncio.gather(*tasks)
+
+    # Only synthesize when full board responds (not single-advisor turns)
+    synthesis = None
+    if target_advisor is None and len(responses) > 1:
+        synthesis = await _get_synthesis(client, question, responses)
+
+    turn_num = len(prior_turns) + 1
+    flat_responses = [
+        {"name": n, "role": r, "color": c, "response": resp}
+        for n, r, c, resp in responses
+    ]
+    new_turn = {
+        "turn": turn_num,
+        "timestamp": datetime.now().isoformat(),
+        "question": question,
+        "target_advisor": target_advisor,
+        "responses": flat_responses,
+        "synthesis": synthesis
+    }
+
+    prior_turns.append(new_turn)
+    session["turns"] = prior_turns
+    session["responses"] = flat_responses
+    if synthesis:
+        session["synthesis"] = synthesis
+    (SESSIONS_DIR / f"{session_id}.json").write_text(json.dumps(session, indent=2))
+
+    if synthesis:
+        asyncio.create_task(_update_knowledge_base(client, question, synthesis))
+
+    return {
+        "session_id": session_id,
+        "turn": new_turn,
+        "turn_number": turn_num
+    }
+
+
 ROUTER_MODEL = "llama-3.1-8b-instant"  # Fast + cheap for routing decisions
 
 async def _route_question(client, question):
-    """Pick the 1-3 most relevant advisors using a fast small model."""
+    """Pick 1-3 advisors and return brief reason for each pick."""
     advisor_list = "\n".join(
         f"- {name}: {config['role']}"
         for name, config in BOARD.items()
@@ -674,28 +823,33 @@ async def _route_question(client, question):
 Advisors:
 {advisor_list}
 
-Pick exactly 1-3 advisors most relevant to this question. Consider: who has direct relevant frameworks? Whose blind spots or specialties make them essential here?
-
-Return ONLY a JSON array, no other text. Example: ["Warren Buffett", "Charlie Munger"]"""
+Pick exactly 1-3 advisors most relevant to this question. Return ONLY a JSON array of objects, no other text.
+Each object: {{"name": "Full Name", "reason": "3-5 word reason"}}
+Example: [{{"name": "Charlie Munger", "reason": "decision biases, inversion"}}, {{"name": "Ray Dalio", "reason": "macro patterns, systems"}}]"""
 
     try:
         resp = await client.chat.completions.create(
             model=ROUTER_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=60,
+            max_tokens=120,
             temperature=0.1
         )
         text = resp.choices[0].message.content.strip()
         match = re.search(r'\[.*?\]', text, re.DOTALL)
         if match:
-            names = json.loads(match.group())
-            valid = [n for n in names if n in BOARD]
-            if 1 <= len(valid) <= 3:
-                return valid
+            parsed = json.loads(match.group())
+            # Accept both old format (list of strings) and new format (list of dicts)
+            if parsed and isinstance(parsed[0], str):
+                valid = [n for n in parsed if n in BOARD]
+                if 1 <= len(valid) <= 3:
+                    return [{"name": n, "reason": ""} for n in valid]
+            elif parsed and isinstance(parsed[0], dict):
+                valid = [p for p in parsed if p.get("name") in BOARD]
+                if 1 <= len(valid) <= 3:
+                    return valid
     except Exception:
         pass
-    # Fallback: top 2 most generalist advisors
-    return ["Charlie Munger", "Ray Dalio"]
+    return [{"name": "Charlie Munger", "reason": "mental models"}, {"name": "Ray Dalio", "reason": "systems thinking"}]
 
 
 RECS_PATH = Path(__file__).parent / "data" / "recommendations.json"
@@ -718,7 +872,9 @@ async def run_board_async(question):
     profile = load_profile()
     client = AsyncGroq(api_key=api_key)
 
-    selected_names = await _route_question(client, question)
+    routed = await _route_question(client, question)
+    selected_names = [r["name"] for r in routed]
+    advisor_reasons = {r["name"]: r["reason"] for r in routed}
     selected_board = {name: BOARD[name] for name in selected_names if name in BOARD}
 
     kb = load_knowledge_base()
@@ -740,9 +896,9 @@ async def run_board_async(question):
     ]
     responses = await asyncio.gather(*tasks)
     synthesis = await _get_synthesis(client, question, responses)
-    session_id = save_session(question, responses, synthesis)
+    session_id = save_session(question, responses, synthesis,
+                               advisors=selected_names, advisor_reasons=advisor_reasons)
 
-    # Run KB update and recommendation extraction in background
     asyncio.create_task(_update_knowledge_base(client, question, synthesis))
     asyncio.create_task(_extract_recommendations(client, session_id, question, synthesis, selected_names))
 
@@ -750,6 +906,8 @@ async def run_board_async(question):
         "session_id": session_id,
         "timestamp": datetime.now().isoformat(),
         "question": question,
+        "advisors": selected_names,
+        "advisor_reasons": advisor_reasons,
         "responses": [
             {"name": n, "role": r, "color": c, "response": resp}
             for n, r, c, resp in responses
