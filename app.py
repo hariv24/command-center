@@ -28,6 +28,17 @@ AUTH_USER = os.getenv("CC_USERNAME", "admin")
 AUTH_PASS = os.getenv("CC_PASSWORD", "changeme")
 
 
+def _friendly_error(e):
+    """Convert raw API errors to human-readable messages."""
+    s = str(e)
+    if "rate_limit_exceeded" in s:
+        import re
+        m = re.search(r'Please try again in (\d+m[\d.]+s)', s)
+        wait = m.group(1) if m else "a few minutes"
+        return f"Token limit reached for today. Try again in {wait}. (Groq free tier: 100k tokens/day)"
+    return s
+
+
 def requires_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -191,7 +202,7 @@ def board():
         result = run_board(question + wellness_append if wellness_append else question)
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": _friendly_error(e)}), 500
 
 
 @app.route("/api/board/quick", methods=["POST"])
@@ -204,7 +215,7 @@ def quick_board():
         result = asyncio.run(get_quick_response(question))
         return jsonify(result)
     except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": _friendly_error(e)}), 500
 
 
 @app.route("/api/recommendations", methods=["GET"])

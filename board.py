@@ -573,16 +573,23 @@ Be specific to their situation — reference past decisions above if relevant.
 Challenge them where their thinking is weak. Give one concrete action they can take this week.
 Speak directly. Under 350 words."""
 
-    response = await client.chat.completions.create(
-        model=MODEL,
-        messages=[
-            {"role": "system", "content": config["system"]},
-            {"role": "user", "content": prompt}
-        ],
-        max_tokens=700,
-        temperature=0.9
-    )
-    return name, config["role"], config["color"], response.choices[0].message.content
+    for model in [MODEL, ROUTER_MODEL]:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": config["system"]},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=700,
+                temperature=0.9
+            )
+            return name, config["role"], config["color"], response.choices[0].message.content
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e) and model == MODEL:
+                continue
+            raise
+    raise RuntimeError("rate_limit_exceeded")
 
 
 async def _get_synthesis(client, question, responses):
@@ -605,13 +612,20 @@ Synthesize — under 250 words, 3 sections:
 
 **The one move this week:** (one specific, concrete action — not a direction, an actual task with a deadline)"""
 
-    response = await client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=500,
-        temperature=0.7
-    )
-    return response.choices[0].message.content
+    for model in [MODEL, ROUTER_MODEL]:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=500,
+                temperature=0.7
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e) and model == MODEL:
+                continue
+            raise
+    raise RuntimeError("rate_limit_exceeded")
 
 
 ROUTER_MODEL = "llama-3.1-8b-instant"  # Fast + cheap for routing decisions
