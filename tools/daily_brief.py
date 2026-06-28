@@ -17,7 +17,9 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROFILE_PATH = Path(__file__).parent.parent / "profile.md"
-MODEL = "llama-3.3-70b-versatile"
+MODEL_HEAVY = "llama-3.3-70b-versatile"   # Board's Verdict — quality matters
+MODEL_FAST  = "llama-3.1-8b-instant"       # Story analyses — speed + token budget
+MODEL = MODEL_HEAVY  # default (kept for backwards compat)
 
 # Topic filters for relevance scoring
 AI_TECH_TOPICS = [
@@ -273,13 +275,23 @@ Write a long-form intelligence brief section. Structure:
 
 Make this comprehensive. A reader should fully understand this story and its implications from this section alone. Do not summarize. Explain."""
 
-    response = await client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=1200,
-        temperature=0.7
-    )
-    return response.choices[0].message.content
+    # Use the fast model for story analyses to stay within daily token budget.
+    # Fall back to heavy model if fast is also throttled.
+    for model in [MODEL_FAST, MODEL_HEAVY]:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=900,
+                temperature=0.7
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e) and model == MODEL_FAST:
+                print(f"  Fast model rate-limited, trying heavy model for story {story_idx}...")
+                continue
+            raise
+    raise RuntimeError("Both models rate-limited — try again later")
 
 
 async def generate_board_verdict(client, story_map, profile):
@@ -302,13 +314,22 @@ Write a "Board's Verdict" — as if Elon Musk, Jeff Bezos, Warren Buffett, Steve
 
 Be direct. Be specific. Write as if their future depends on this."""
 
-    response = await client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=600,
-        temperature=0.7
-    )
-    return response.choices[0].message.content
+    # Board's Verdict uses the heavy model for quality; falls back to fast if throttled
+    for model in [MODEL_HEAVY, MODEL_FAST]:
+        try:
+            response = await client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=600,
+                temperature=0.7
+            )
+            return response.choices[0].message.content
+        except Exception as e:
+            if "rate_limit_exceeded" in str(e) and model == MODEL_HEAVY:
+                print("  Heavy model rate-limited for Board's Verdict, falling back to fast model...")
+                continue
+            raise
+    raise RuntimeError("Both models rate-limited for Board's Verdict")
 
 
 async def run_daily_brief_async():
