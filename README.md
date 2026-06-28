@@ -115,15 +115,17 @@ The more honest and specific this is, the better every output gets.
 
 ### 4. Set your north stars
 
-In `app.py`, find `NORTH_STAR` and update the target dates to your own milestones:
+In `app.py`, find `NORTH_STAR` and update it with your own 3 milestone targets — anything you want to count down to:
 
 ```python
 NORTH_STAR = {
-    "nyc":     {"label": "Goal 1", "target": "2028-01-01", ...},
-    "million": {"label": "Goal 2", "target": "2032-01-01", ...},
-    "billion": {"label": "Goal 3", "target": "2042-01-01", ...},
+    "milestone_1": {"label": "Your Label", "target": "YYYY-MM-DD", "age": 0, "what": "What this milestone means."},
+    "milestone_2": {"label": "Your Label", "target": "YYYY-MM-DD", "age": 0, "what": "What this milestone means."},
+    "milestone_3": {"label": "Your Label", "target": "YYYY-MM-DD", "age": 0, "what": "What this milestone means."},
 }
 ```
+
+These show as countdown strips on your home dashboard. Set them to whatever matters to you.
 
 ### 5. Download advisor photos
 
