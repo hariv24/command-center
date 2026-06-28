@@ -516,8 +516,7 @@ def load_profile():
 def load_knowledge_base():
     if KB_PATH.exists():
         kb = KB_PATH.read_text()
-        # Inject only last 1200 chars to stay within token budget
-        return kb[-1200:] if len(kb) > 1200 else kb
+        return kb[-2500:] if len(kb) > 2500 else kb
     return ""
 
 
@@ -676,6 +675,17 @@ async def run_board_async(question):
     selected_board = {name: BOARD[name] for name in selected_names if name in BOARD}
 
     kb = load_knowledge_base()
+
+    # Inject live context from all modules so advisors know current reality
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        import app as _app
+        live_ctx = _app._build_live_context()
+        if live_ctx:
+            kb = (kb or "") + f"\n\n[LIVE CONTEXT — {datetime.now().strftime('%Y-%m-%d')}]\n{live_ctx}"
+    except Exception:
+        pass
 
     tasks = [
         _get_advisor_response(client, name, config, question, profile, kb)

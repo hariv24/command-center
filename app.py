@@ -76,6 +76,57 @@ VITALS_FILE = DATA_DIR / "vitals.json"
 CONVICTIONS_FILE = DATA_DIR / "convictions.json"
 WELLNESS_BRIEF_FILE = DATA_DIR / "wellness_brief.json"
 CONVICTION_CHAT_FILE = DATA_DIR / "conviction_chat.json"
+RECS_FILE = Path(__file__).parent / "data" / "recommendations.json"
+
+
+def _build_live_context(include_goals=True, include_decisions=True,
+                         include_logs=True, include_recs=True):
+    """
+    Assemble a compact, structured snapshot of current state from all data files.
+    Only includes sections that have actual data — never injects empty noise.
+    """
+    from datetime import date, timedelta
+    today = date.today()
+    parts = []
+
+    if include_goals:
+        goals = load_json(GOALS_FILE)
+        active = [g for g in goals if g.get("status") == "active"]
+        if active:
+            lines = []
+            for g in active:
+                try:
+                    days_left = (date.fromisoformat(g["deadline"]) - today).days
+                    urgency = f" ⚠ {days_left}d left" if days_left < 90 else f" — {days_left}d left"
+                except Exception:
+                    urgency = ""
+                lines.append(f"- {g['title']}: target {g.get('target','')} by {g.get('deadline','')}{urgency}")
+            parts.append("ACTIVE GOALS:\n" + "\n".join(lines))
+
+    if include_decisions:
+        decs = [d for d in load_json(DECISIONS_FILE) if not d.get("outcome")]
+        if decs:
+            lines = [f"- \"{d.get('decision','')[:100]}\" (logged {d.get('date','')})" for d in decs[-5:]]
+            parts.append("OPEN DECISIONS (unresolved):\n" + "\n".join(lines))
+
+    if include_logs:
+        logs = load_json(DAILY_LOG_FILE)
+        recent = [l for l in logs if l.get("date", "") >= (today - timedelta(days=4)).isoformat()]
+        if recent:
+            lines = [f"- {l['date']}: Did: {l.get('did','')[:100]} | Blocked: {l.get('didnt','')[:80]} | Energy: {l.get('energy','—')}"
+                     for l in recent[-3:]]
+            parts.append("RECENT DAILY LOGS:\n" + "\n".join(lines))
+
+    if include_recs:
+        recs = load_json(RECS_FILE) if RECS_FILE.exists() else []
+        unactioned = [r for r in recs if r.get("status") == "pending"]
+        if unactioned:
+            lines = [f"- \"{r.get('recommendation','')[:100]}\" ({r.get('date','')})" for r in unactioned[-3:]]
+            parts.append(f"UNACTIONED BOARD RECOMMENDATIONS ({len(unactioned)} total):\n" + "\n".join(lines))
+
+    if not parts:
+        return ""
+    return "\n\n".join(parts)
 
 # Hariv's immutable north star — calibrated to his actual stated goals
 NORTH_STAR = {
@@ -178,18 +229,40 @@ def update_recommendation(rec_id):
 
 @app.route("/api/brief", methods=["POST"])
 def brief():
-    try:
-        result = asyncio.run(run_daily_brief_async())
-        return jsonify({"brief": result})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    from datetime import date
+    import threading
+    today = date.today().strftime("%Y-%m-%d")
+    brief_file = BRIEFS_DIR / f"{today}.md"
+    # Serve from file cache if already generated today
+    if brief_file.exists() and brief_file.stat().st_size > 1000:
+        return jsonify({"brief": brief_file.read_text(), "cached": True})
+    # Start background generation and tell client to poll
+    def _run():
+        try:
+            asyncio.run(run_daily_brief_async())
+        except Exception as e:
+            print(f"[BRIEF] generation failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"generating": True})
+
+
+@app.route("/api/brief/poll", methods=["GET"])
+def brief_poll():
+    from datetime import date
+    today = date.today().strftime("%Y-%m-%d")
+    brief_file = BRIEFS_DIR / f"{today}.md"
+    if brief_file.exists() and brief_file.stat().st_size > 1000:
+        return jsonify({"brief": brief_file.read_text(), "done": True})
+    return jsonify({"done": False})
 
 
 @app.route("/api/briefs", methods=["GET"])
 def list_briefs():
+    import re
     briefs = []
     for f in sorted(BRIEFS_DIR.glob("*.md"), reverse=True):
-        briefs.append({"date": f.stem, "filename": f.name})
+        if re.match(r'^\d{4}-\d{2}-\d{2}$', f.stem):  # only YYYY-MM-DD intel briefs
+            briefs.append({"date": f.stem, "filename": f.name})
     return jsonify(briefs)
 
 
@@ -481,33 +554,40 @@ Rules:
 # ── Wellness / Vitals agent ───────────────────────────────────
 VITALS_FILE = DATA_DIR / "vitals.json"
 
-WELLNESS_SYSTEM = """You are Hariv's personal wellness coach — not a therapist, not a bot, a real coach who knows him deeply.
+WELLNESS_SYSTEM = """You are the user at 50 years old — looking back at yourself at 23.
 
-WHO HARIV IS: 23-year-old Indian founder from Trichy. Building an automation agency + SaaS. Goal: NYC, billionaire. Quit drinking, going to gym, sobriety is non-negotiable. Went through a bad breakup. High-pressure life — juggling a ₹25k/month job he wants to quit, a demanding agency client, product building, and a move to NYC. Rapper background. Intense personality — wants to move fast, hates wasted time.
+You've lived through everything they're currently in the middle of. The heartbreaks that felt unsurvivable. The family tension that felt permanent. The spirals at 2am over people who didn't deserve that much of your energy. You came out the other side. You know exactly what mattered and what was noise.
 
-YOUR JOB:
-- Track patterns in his physical and mental state over time
-- Ask specific follow-up questions to understand root causes, not just symptoms
-- Be direct when you see concerning patterns (not sleeping, not eating, anxiety spiraling)
-- Celebrate wins — gym, sobriety, focus days
-- Connect physical state to work performance: "You mentioned low energy Wednesday — you also said you had a late night Tuesday. That's a pattern."
-- Give actionable, specific advice, not generic wellness platitudes
-- Remember what he's told you in previous check-ins
+You are not an outside voice. You are them — with 27 more years of living. You know how their mind works because it is your mind. You know the patterns they can't see yet because you watched yourself repeat them. You know what they needed to hear at this age, and you know that nobody said it clearly enough.
 
-TONE: Direct. Warm but no-nonsense. Like a coach who's invested in you, not a healthcare professional covering their ass. Use his language. Don't be clinical. Don't say "I understand that must be difficult." Say "That makes sense given the pressure you're under right now."
+HOW YOU TALK TO THEM:
+- Like you're talking to yourself. Deep familiarity. No explaining needed.
+- Let them get everything out before you say anything. You remember how much you hated being interrupted mid-vent.
+- When you respond, respond to what they actually said — not a summary, not a framework.
+- Be honest in a way only you can be. You're not judging them — you lived this. But you're not going to watch yourself make the same mistake you made and say nothing.
+- When they're in a spiral, name it clearly. "I know what's happening here. I did this too."
+- When they're being too hard on themselves, say that. When they're not being hard enough, say that too.
+- You have perspective they don't have yet. Use it — but don't lecture. One clear truth lands better than five points.
 
-PATTERNS TO WATCH:
-- Sleep quality and hours (7-8h is his target)
-- Gym consistency (3-4x/week is his habit)
-- Anxiety or stress spikes
-- Energy levels through the day
-- Food and nutrition quality
-- Mental state: focus, confidence, motivation
-- Sobriety (absolute — never question this, only support)
+WHAT THIS SPACE IS FOR:
+Everything that doesn't go to the board. The board gets strategy and business. This is for the human weight underneath all of it:
 
-When you see patterns, name them explicitly. "You've mentioned low energy 3 check-ins in a row. That's not a coincidence." Build a mental model of what his baseline looks like and flag deviations.
+LOVE LIFE:
+You remember every one of these feelings. The obsession, the confusion, the stories you told yourself about someone. You know which ones were real and which ones were your own loneliness or ego talking. You won't moralize or tell them what to feel. But you'll name what you see clearly — "you've mentioned her three times now, something's still sitting there" — because you wish someone had done that for you when you were 23.
 
-Ask 1-2 specific questions per response. Never give a wall of advice. Be a conversation, not a lecture."""
+FAMILY:
+You understand the specific weight of Indian family dynamics — the love and the pressure arriving in the same breath, the guilt that doesn't fit any Western framework, the things that never get said directly but everyone feels. You don't hand them therapy scripts. You understand this from the inside, because you lived it.
+
+MONEY AND FINANCIAL STRESS:
+Not the strategy — that's for the board. This is the fear underneath the numbers. The 2am anxiety about whether you're falling behind, the shame when things aren't moving, the pressure of feeling responsible for your own future before you've figured out who you are. You lived through that exact feeling. You know what it actually cost you emotionally and what was just noise.
+
+IMPORTANT PERSONAL DECISIONS:
+The ones that keep them up at night. Not "should I pivot my SaaS" — that goes to the board. But "should I stay or leave," "am I making this choice for the right reasons," "what am I actually afraid of here." The decisions that are really about identity, values, and fear dressed up as logic. You know how to cut through the rationalization because you watched yourself do it for years.
+
+TONE:
+Calm. Warm but direct. The way you'd talk to yourself if you could. Not clinical, not formal, not a wall of advice. Conversational. Sometimes a single sentence is the whole response. You can be dry and funny when the moment calls for it — sometimes that's the only way through.
+
+You are not a therapist. You are not a coach. You are them — older, clearer, and still rooting for yourself."""
 
 
 def _update_wellness_brief():
@@ -565,23 +645,74 @@ def vitals_chat():
 
     # Build context from recent check-ins for the coach's memory
     recent = vitals[-10:] if len(vitals) > 10 else vitals
-    memory_context = ""
-    if recent:
-        memory_lines = []
-        for v in recent:
-            memory_lines.append(f"[{v['date']}] User: {v['user'][:200]}\nCoach: {v['coach'][:200]}")
-        memory_context = "\n\n".join(memory_lines[-5:])
+    memory_lines = []
+    for v in recent:
+        memory_lines.append(f"[{v['date']}] You: {v['user'][:200]}\nMe: {v['coach'][:200]}")
+    memory_context = "\n\n".join(memory_lines[-5:])
+
+    # --- Cross-module context: everything the future-self should already know ---
+    from datetime import date, timedelta
+    today = date.today()
+
+    # Daily logs — last 7 days
+    logs = load_json(DAILY_LOG_FILE)
+    recent_logs = [l for l in logs if l.get("date","") >= (today - timedelta(days=7)).isoformat()]
+    days_since_log = (today - date.fromisoformat(sorted([l["date"] for l in logs])[-1])).days if logs else 99
+    log_summary = ""
+    if recent_logs:
+        log_lines = [f"[{l['date']}] Did: {l.get('did','')[:120]} | Blocked: {l.get('didnt','')[:80]} | Energy: {l.get('energy','')}" for l in recent_logs[-5:]]
+        log_summary = "\n".join(log_lines)
+
+    # Open decisions (unresolved)
+    open_decs = [d for d in load_json(DECISIONS_FILE) if not d.get("outcome")]
+    dec_summary = ""
+    if open_decs:
+        dec_lines = [f"- '{d.get('decision','')[:100]}' (logged {d.get('date','')})" for d in open_decs[-5:]]
+        dec_summary = "\n".join(dec_lines)
+
+    # Recent board session topics
+    sessions_ctx = []
+    for f in sorted(Path(__file__).parent.joinpath("sessions").glob("*.json"), reverse=True)[:5]:
+        try:
+            s = json.loads(f.read_text())
+            sessions_ctx.append(f"- [{s.get('timestamp','')[:10]}] Asked: {s['question'][:100]}")
+        except Exception:
+            pass
+
+    # Recent expenses (last 30 days)
+    expenses = load_json(EXPENSES_FILE)
+    recent_expenses = [e for e in expenses if e.get("date","") >= (today - timedelta(days=30)).isoformat()]
+    total_spent = sum(e.get("amount", 0) for e in recent_expenses)
+
+    # Build the cross-module context block
+    cross_context_parts = []
+    if days_since_log > 1:
+        cross_context_parts.append(f"LOGS: Last daily log was {days_since_log} day(s) ago.")
+    if log_summary:
+        cross_context_parts.append(f"RECENT LOGS (last 7 days):\n{log_summary}")
+    if dec_summary:
+        cross_context_parts.append(f"OPEN DECISIONS (unresolved, sitting in the system):\n{dec_summary}")
+    if sessions_ctx:
+        cross_context_parts.append(f"RECENT BOARD SESSIONS (what I've been taking to advisors):\n" + "\n".join(sessions_ctx))
+    if recent_expenses:
+        cross_context_parts.append(f"MONEY: Spent ₹{total_spent:,.0f} in the last 30 days across {len(recent_expenses)} transactions.")
+
+    cross_context = "\n\n".join(cross_context_parts)
 
     async def _respond():
         api_key = os.getenv("GROQ_API_KEY")
         client = _AsyncGroq(api_key=api_key)
 
-        messages = [{"role": "system", "content": WELLNESS_SYSTEM}]
+        system = WELLNESS_SYSTEM
+        if cross_context:
+            system += f"\n\n--- WHAT YOU ALREADY KNOW (from the rest of the system) ---\n{cross_context}\n--- Use this naturally. Don't recite it. Only reference it if it's genuinely relevant. ---"
+
+        messages = [{"role": "system", "content": system}]
 
         if memory_context:
             messages.append({
                 "role": "user",
-                "content": f"Here's context from recent check-ins:\n{memory_context}\n\nCurrent message: {message}"
+                "content": f"Previous conversations between us:\n{memory_context}\n\nWhat I want to talk about now: {message}"
             })
         else:
             messages.append({"role": "user", "content": message})
@@ -955,6 +1086,39 @@ def get_convictions():
     return jsonify(load_json(CONVICTIONS_FILE))
 
 
+@app.route("/api/convictions/<conviction_id>", methods=["PUT"])
+def update_conviction(conviction_id):
+    d = request.get_json()
+    convictions = load_json(CONVICTIONS_FILE)
+    updated = None
+    for c in convictions:
+        if c["id"] == conviction_id:
+            old_status = c.get("status", "active")
+            c.update({k: v for k, v in d.items() if k != "id"})
+            updated = c
+            # When a conviction is validated or invalidated, append to KB
+            new_status = c.get("status", "active")
+            if new_status in ("validated", "invalidated") and old_status not in ("validated", "invalidated"):
+                try:
+                    kb = KB_PATH.read_text() if KB_PATH.exists() else "# Knowledge Base\n"
+                    board_tests = c.get("board_tests", 0)
+                    entry = (f"\n- [{datetime.now().strftime('%Y-%m-%d')}] Conviction [{new_status.upper()}]: "
+                             f"\"{c.get('belief', '')[:120]}\" — "
+                             f"held since {c.get('created', '')[:10]}, tested {board_tests}x via board. "
+                             f"(source: conviction tracker)")
+                    if "## Validated Convictions" in kb:
+                        kb = kb.replace("## Validated Convictions\n",
+                                        f"## Validated Convictions\n{entry}\n")
+                    else:
+                        kb += f"\n\n## Validated Convictions\n{entry}\n"
+                    KB_PATH.write_text(kb)
+                except Exception:
+                    pass
+            break
+    save_json(CONVICTIONS_FILE, convictions)
+    return jsonify(updated or {"ok": True})
+
+
 @app.route("/api/convictions/<conviction_id>", methods=["DELETE"])
 def delete_conviction(conviction_id):
     convictions = [c for c in load_json(CONVICTIONS_FILE) if c["id"] != conviction_id]
@@ -1252,6 +1416,151 @@ def cron_intel_trigger():
     return jsonify({"ok": True, "message": "Brief generation started in background"})
 
 
+@app.route("/api/cron/weekly", methods=["POST"])
+def cron_weekly_trigger():
+    """Called by cron Sunday evening. Generates weekly cross-module synthesis."""
+    import threading
+    def _run():
+        try:
+            _generate_weekly_synthesis()
+        except Exception as e:
+            print(f"[WEEKLY] synthesis failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "message": "Weekly synthesis started"})
+
+
+@app.route("/api/weekly", methods=["GET"])
+def get_weekly_synthesis():
+    """Return the latest weekly synthesis."""
+    files = sorted(BRIEFS_DIR.glob("weekly_*.md"), reverse=True)
+    if not files:
+        return jsonify({"content": None, "date": None})
+    f = files[0]
+    return jsonify({"content": f.read_text(), "date": f.stem.replace("weekly_", "")})
+
+
+def _generate_weekly_synthesis():
+    """Pull from all 8 modules and synthesize the week's real patterns."""
+    from groq import Groq as _Groq
+    from datetime import date, timedelta
+    api_key = os.getenv("GROQ_API_KEY")
+    if not api_key:
+        return
+    client = _Groq(api_key=api_key)
+    today = date.today()
+    week_start = (today - timedelta(days=7)).isoformat()
+
+    # --- Pull from every module ---
+
+    # Daily logs
+    logs = load_json(DAILY_LOG_FILE)
+    week_logs = [l for l in logs if l.get("date", "") >= week_start]
+    log_block = ""
+    if week_logs:
+        lines = [f"[{l['date']}] Did: {l.get('did','—')[:150]} | Blocked by: {l.get('didnt','—')[:100]} | Energy: {l.get('energy','—')}" for l in week_logs]
+        log_block = "\n".join(lines)
+
+    # Days not logged
+    days_logged = len(set(l["date"] for l in week_logs))
+    days_missing = 7 - days_logged
+
+    # Board sessions this week
+    board_sessions = []
+    for f in sorted(Path(__file__).parent.joinpath("sessions").glob("*.json"), reverse=True):
+        try:
+            s = json.loads(f.read_text())
+            if s.get("timestamp", "")[:10] >= week_start:
+                board_sessions.append(f"[{s['timestamp'][:10]}] Q: {s['question'][:120]}\nSynthesis: {s.get('synthesis','')[:200]}")
+        except Exception:
+            pass
+
+    # Wellness conversations this week
+    vitals = load_json(VITALS_FILE)
+    week_vitals = [v for v in vitals if v.get("date", "") >= week_start]
+    vitals_block = ""
+    if week_vitals:
+        lines = [f"[{v['date']}] You: {v['user'][:200]}" for v in week_vitals]
+        vitals_block = "\n".join(lines)
+
+    # Open decisions
+    open_decs = [d for d in load_json(DECISIONS_FILE) if not d.get("outcome")]
+    dec_block = "\n".join([f"- {d.get('decision','')[:120]} (since {d.get('date','')})" for d in open_decs]) if open_decs else "None"
+
+    # Goals with deadlines approaching
+    goals = load_json(GOALS_FILE)
+    active_goals = [g for g in goals if g.get("status") == "active"]
+    goals_block = "\n".join([f"- {g['title']}: target {g.get('target','')} by {g.get('deadline','')}" for g in active_goals[:5]]) if active_goals else ""
+
+    # Expenses this week
+    expenses = load_json(EXPENSES_FILE)
+    week_expenses = [e for e in expenses if e.get("date", "") >= week_start]
+    total_spent = sum(e.get("amount", 0) for e in week_expenses)
+
+    # Knowledge base (latest)
+    kb = KB_PATH.read_text()[-600:] if KB_PATH.exists() else ""
+
+    prompt = f"""You are generating a weekly cross-module synthesis for someone's personal command center. You have access to everything that happened this week across all areas of their life.
+
+WEEK OF {week_start} to {today.isoformat()}
+
+DAILY LOGS ({days_logged}/7 days logged, {days_missing} days missing):
+{log_block or 'No logs this week.'}
+
+BOARD SESSIONS (strategic questions asked this week):
+{chr(10).join(board_sessions) if board_sessions else 'None'}
+
+PERSONAL CONVERSATIONS (wellness/vitals this week):
+{vitals_block or 'No check-ins this week.'}
+
+OPEN DECISIONS (unresolved, sitting there):
+{dec_block}
+
+ACTIVE GOALS:
+{goals_block or 'None set'}
+
+MONEY: Spent ₹{total_spent:,.0f} across {len(week_expenses)} transactions this week.
+
+KNOWLEDGE BASE (recent learnings):
+{kb}
+
+---
+
+Write a weekly synthesis. Be direct, specific, and honest. Structure:
+
+## Week of {today.strftime('%B %d, %Y')}
+
+**What actually happened this week**
+[2-3 sentences. Not a summary — the real story of the week based on the data. What did they do, what blocked them, where did energy go.]
+
+**The pattern underneath**
+[The one thread connecting logs + decisions + what they talked about personally. What's really going on? What is the week actually revealing about where they are right now?]
+
+**What's unresolved and needs attention**
+[Open decisions, recurring blockers, emotional themes that came up multiple times. Be specific.]
+
+**What the data says vs. what they probably think**
+[Where does the objective record disagree with how they probably feel about the week? Be honest.]
+
+**One thing to carry into next week**
+[Not a list. One specific thing — an action, a mindset shift, or something to stop doing.]
+
+Write as someone who has seen all the data and sees the full picture. Not harsh, not gentle — just clear."""
+
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=800,
+        temperature=0.7
+    )
+    content = response.choices[0].message.content.strip()
+
+    BRIEFS_DIR.mkdir(exist_ok=True)
+    out_file = BRIEFS_DIR / f"weekly_{today.isoformat()}.md"
+    out_file.write_text(content)
+    print(f"[WEEKLY] Synthesis saved to {out_file}")
+    return content
+
+
 @app.route("/api/home/morning", methods=["POST"])
 def morning_brief():
     from groq import AsyncGroq as _AsyncGroq
@@ -1285,6 +1594,19 @@ def morning_brief():
     goals = load_json(GOALS_FILE)
     kb = KB_PATH.read_text()[-800:] if KB_PATH.exists() else ""
     nyc_days = (date.fromisoformat("2028-01-01") - date.today()).days
+
+    # Pull today's intel Board's Verdict (generated at 5am, we run at 5:30am)
+    intel_signal = ""
+    intel_file = BRIEFS_DIR / f"{today}.md"
+    if intel_file.exists():
+        raw = intel_file.read_text()
+        if "## Board's Verdict" in raw:
+            verdict = raw.split("## Board's Verdict")[-1].strip()[:800]
+            intel_signal = f"TODAY'S MACRO SIGNAL (from morning intel):\n{verdict}"
+
+    # Unactioned board recommendations
+    all_recs = load_json(RECS_FILE) if RECS_FILE.exists() else []
+    unactioned_recs = [r for r in all_recs if r.get("status") == "pending"]
 
     # Accountability signals — computed before prompt
     days_since_log = 0
@@ -1352,7 +1674,11 @@ RECENT BOARD SESSIONS: {json.dumps(sessions_ctx, indent=2)}
 
 KNOWLEDGE BASE: {kb}
 
-GOALS: {json.dumps([{"title":g["title"],"current":g.get("current",""),"target":g.get("target",""),"deadline":g.get("deadline","")} for g in goals[:4]], indent=2)}"""
+GOALS: {json.dumps([{"title":g["title"],"current":g.get("current",""),"target":g.get("target",""),"deadline":g.get("deadline","")} for g in goals[:4]], indent=2)}
+
+{intel_signal}
+
+{f"UNACTIONED BOARD RECS ({len(unactioned_recs)}): " + " | ".join(r.get("recommendation","")[:60] for r in unactioned_recs[:3]) if unactioned_recs else ""}"""
 
     async def _gen():
         from board import MODEL as _M
@@ -1426,9 +1752,32 @@ def evening_reflection():
     wellness_ctx = wb.get("content", "No wellness data yet.") if wb else "No wellness data yet."
     wellness_date = wb.get("date", "") if wb else ""
 
-    ctx = f"""Hariv: 23yo Indian founder. NYC in {nyc_days} days. $1B by 39-40. Sobriety non-negotiable. High pressure — job + agency + SaaS simultaneously.
+    # Morning brief — what was the intention set this morning?
+    morning_cache = load_json(MORNING_CACHE_FILE) if MORNING_CACHE_FILE.exists() else {}
+    morning_content = ""
+    if isinstance(morning_cache, dict) and morning_cache.get("date") == today and morning_cache.get("content"):
+        morning_content = morning_cache["content"][:600]
 
+    # Decisions logged today
+    today_decisions = [d for d in load_json(DECISIONS_FILE) if d.get("date") == today]
+
+    # Board sessions today
+    today_sessions = []
+    for f in sorted(Path(__file__).parent.joinpath("sessions").glob("*.json"), reverse=True)[:5]:
+        try:
+            s = json.loads(f.read_text())
+            if s.get("timestamp", "")[:10] == today:
+                today_sessions.append(s["question"][:80])
+        except Exception:
+            pass
+
+    ctx = f"""23yo founder. NYC in {nyc_days} days. $1B by 39-40. High pressure — job + agency + SaaS simultaneously.
+
+{f"THIS MORNING'S BRIEF SET THIS INTENTION:{chr(10)}{morning_content}{chr(10)}" if morning_content else ""}
 TODAY ({today}): {json.dumps({"did": today_log.get("did",""), "didnt": today_log.get("didnt",""), "energy": today_log.get("energy","")} if today_log else "not logged yet")}
+
+{f"DECISIONS MADE TODAY: {json.dumps([d['decision'][:80] for d in today_decisions])}" if today_decisions else ""}
+{f"BOARD CONSULTED TODAY ON: {json.dumps(today_sessions)}" if today_sessions else ""}
 
 LAST 7 DAYS:
 {json.dumps([{"date":l["date"],"did":l.get("did","")[:60],"didnt":l.get("didnt","")[:60],"energy":l.get("energy","")} for l in recent_logs[-7:]], indent=2)}

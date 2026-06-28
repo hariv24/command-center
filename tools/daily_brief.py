@@ -168,59 +168,56 @@ def select_diverse_stories(all_stories):
     Pick 7 stories across different angles: hottest, viral, controversial,
     breaking, AI/tech, startup/biz, wildcard.
     Each slot gets a distinct story — no duplicates.
+    Falls back to any unseen story if the preferred pool is exhausted.
     """
     relevant = [s for s in all_stories if is_relevant(s["title"], s.get("selftext", ""))]
     irrelevant = [s for s in all_stories if not is_relevant(s["title"], s.get("selftext", ""))]
+    all_by_score = sorted(all_stories, key=lambda x: x["score"], reverse=True)
 
     seen_ids = set()
     selected = {}
 
-    def pick(pool, key):
-        for s in pool:
-            sid = s.get("id") or s["title"][:50]
-            if sid not in seen_ids:
-                seen_ids.add(sid)
-                selected[key] = s
-                return s
+    def pick(pool, key, fallback=None):
+        """Pick first unseen story from pool, falling back to fallback pool, then any story."""
+        for p in [pool, fallback or [], all_by_score]:
+            for s in p:
+                sid = s.get("id") or s["title"][:50]
+                if sid not in seen_ids:
+                    seen_ids.add(sid)
+                    selected[key] = s
+                    return s
         return None
 
-    # HOTTEST — highest score across all relevant
+    # HOTTEST — highest score (relevant preferred, any as fallback)
     by_score = sorted(relevant, key=lambda x: x["score"], reverse=True)
-    pick(by_score, "HOTTEST")
+    pick(by_score, "HOTTEST", fallback=all_by_score)
 
     # VIRAL — highest comment count
     by_comments = sorted(relevant, key=lambda x: x["comment_count"], reverse=True)
-    pick(by_comments, "VIRAL")
+    pick(by_comments, "VIRAL", fallback=sorted(all_stories, key=lambda x: x["comment_count"], reverse=True))
 
-    # MOST CONTROVERSIAL — high comments relative to score (strong disagreement)
+    # MOST CONTROVERSIAL — high comments relative to score
     controversial = sorted(relevant, key=lambda x: x["comment_count"] / (x["score"] + 1), reverse=True)
-    pick(controversial, "MOST CONTROVERSIAL")
+    pick(controversial, "MOST CONTROVERSIAL", fallback=sorted(all_stories, key=lambda x: x["comment_count"] / (x["score"] + 1), reverse=True))
 
-    # BREAKING — newest timestamp (highest unix time)
+    # BREAKING — newest timestamp
     by_time = sorted(all_stories, key=lambda x: x.get("time", 0), reverse=True)
-    # Prefer relevant but fall back to any
     breaking_pool = [s for s in by_time if is_relevant(s["title"], s.get("selftext", ""))]
-    if not breaking_pool:
-        breaking_pool = by_time
-    pick(breaking_pool, "BREAKING")
+    pick(breaking_pool or by_time, "BREAKING", fallback=by_time)
 
-    # AI & TECH — top scored AI/tech story not yet picked
+    # AI & TECH — top scored AI/tech story
     ai_pool = sorted([s for s in all_stories if is_ai_tech(s["title"], s.get("selftext", ""))],
                      key=lambda x: x["score"], reverse=True)
-    pick(ai_pool, "AI & TECH")
+    pick(ai_pool, "AI & TECH", fallback=all_by_score)
 
-    # STARTUP & BUSINESS — top scored startup/biz story not yet picked
+    # STARTUP & BUSINESS — top scored startup/biz story
     biz_pool = sorted([s for s in all_stories if is_startup_biz(s["title"], s.get("selftext", ""))],
                       key=lambda x: x["score"], reverse=True)
-    pick(biz_pool, "STARTUP & BUSINESS")
+    pick(biz_pool, "STARTUP & BUSINESS", fallback=all_by_score)
 
-    # WILDCARD — something from outside AI/startup world, highest score
+    # WILDCARD — outside AI/startup world
     wild_pool = sorted(irrelevant, key=lambda x: x["score"], reverse=True)
-    if not wild_pool:
-        # Fall back to any remaining relevant story
-        remaining = [s for s in by_score if (s.get("id") or s["title"][:50]) not in seen_ids]
-        wild_pool = remaining
-    pick(wild_pool, "WILDCARD")
+    pick(wild_pool, "WILDCARD", fallback=all_by_score)
 
     return selected  # dict: category -> story
 
@@ -320,6 +317,22 @@ async def run_daily_brief_async():
         raise ValueError("GROQ_API_KEY not set in .env")
 
     profile = PROFILE_PATH.read_text() if PROFILE_PATH.exists() else ""
+
+    # Load active goals to make intel analysis goal-aware
+    goals_file = Path(__file__).parent.parent / "data" / "goals.json"
+    goals_ctx = ""
+    if goals_file.exists():
+        try:
+            goals = json.loads(goals_file.read_text())
+            active = [g for g in goals if g.get("status") == "active"]
+            if active:
+                goals_ctx = "Active goals:\n" + "\n".join(
+                    f"- {g['title']}: target {g.get('target','')} by {g.get('deadline','')}"
+                    for g in active[:6]
+                )
+        except Exception:
+            pass
+
     client = AsyncGroq(api_key=api_key)
 
     print("  Fetching HN stories + comments...")
@@ -349,12 +362,14 @@ async def run_daily_brief_async():
 
     print(f"  Analyzing {len(story_map)} stories in parallel...")
 
+    full_profile = (profile + ("\n\n" + goals_ctx if goals_ctx else "")).strip()
+
     analysis_tasks = [
-        analyze_story(client, story, cat, CATEGORIES[cat], idx + 1, profile)
+        analyze_story(client, story, cat, CATEGORIES[cat], idx + 1, full_profile)
         for idx, (cat, story) in enumerate(story_map.items())
     ]
     analyses = await asyncio.gather(*analysis_tasks)
-    board_verdict = await generate_board_verdict(client, story_map, profile)
+    board_verdict = await generate_board_verdict(client, story_map, full_profile)
 
     date_str = datetime.now().strftime("%A, %B %d %Y")
     sections = [

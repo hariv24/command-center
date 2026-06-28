@@ -503,6 +503,16 @@ select option{background:var(--s2)}
       <div id="ppl" style="background:var(--s2);border:1px solid var(--h1);padding:11px"><div style="font-size:11px;color:var(--t3)">Loading...</div></div>
     </div>
   </div>
+
+  <div id="weekly-wrap" style="margin-top:18px;display:none;animation:fadeUp .45s cubic-bezier(.16,1,.3,1) .3s both">
+    <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+      <div class="slabel" style="margin-bottom:0">Weekly Synthesis</div>
+      <div style="font-size:9px;color:var(--t3);letter-spacing:1.5px;text-transform:uppercase" id="weekly-date"></div>
+    </div>
+    <div class="card" style="padding:16px 18px">
+      <div id="weekly-body" style="font-size:13px;line-height:1.7;color:var(--t2)"></div>
+    </div>
+  </div>
 </div>
 
 <!-- BOARD -->
@@ -828,7 +838,14 @@ async function initHome(){
     if(t.tomorrow)document.getElementById('lgt').value=t.tomorrow;
     if(t.energy){document.getElementById('lge').value=t.energy;document.getElementById('lgev').textContent=t.energy;}
   }
-  loadPeople();setMode(curMode);genBrief();
+  loadPeople();setMode(curMode);genBrief();loadWeekly();
+}
+async function loadWeekly(){
+  const d=await fetch('/api/weekly').then(r=>r.json()).catch(()=>({}));
+  if(!d.content)return;
+  document.getElementById('weekly-wrap').style.display='block';
+  document.getElementById('weekly-date').textContent=d.date||'';
+  document.getElementById('weekly-body').innerHTML=marked.parse(d.content);
 }
 
 async function loadPeople(){
@@ -1003,10 +1020,26 @@ async function loadBriefDate(date,el){
   document.getElementById('ic').innerHTML=marked.parse(d.content||d.error||'');document.getElementById('ic').classList.add('on');document.getElementById('isk').classList.remove('on');
 }
 async function runBrief(){
-  document.getElementById('ic').classList.remove('on');document.getElementById('isk').classList.add('on');
-  try{const d=await post('/api/brief',{});if(d.error)throw new Error(d.error);document.getElementById('ic').innerHTML=marked.parse(d.brief);document.getElementById('ic').classList.add('on');loadIntelHist();}
-  catch(e){document.getElementById('ic').innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';document.getElementById('ic').classList.add('on');}
-  finally{document.getElementById('isk').classList.remove('on');}
+  const ic=document.getElementById('ic'),isk=document.getElementById('isk');
+  ic.classList.remove('on');isk.classList.add('on');
+  try{
+    const d=await post('/api/brief',{});
+    if(d.error)throw new Error(d.error);
+    if(d.brief){
+      ic.innerHTML=marked.parse(d.brief);ic.classList.add('on');loadIntelHist();
+    } else if(d.generating){
+      ic.innerHTML='<p style="color:var(--t2);font-size:12px;font-family:var(--fm)">Fetching stories + generating analysis — takes 2-3 min. Checking every 10s...</p>';
+      ic.classList.add('on');
+      // Poll until done
+      const poll=setInterval(async()=>{
+        try{
+          const p=await fetch('/api/brief/poll').then(r=>r.json());
+          if(p.done){clearInterval(poll);isk.classList.remove('on');ic.innerHTML=marked.parse(p.brief);loadIntelHist();}
+        }catch(e){clearInterval(poll);isk.classList.remove('on');}
+      },10000);
+    }
+  }catch(e){ic.innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';ic.classList.add('on');}
+  finally{if(!document.querySelector('.poll-active'))isk.classList.remove('on');}
 }
 async function runScan(){
   document.getElementById('ic').classList.remove('on');document.getElementById('isk').classList.add('on');
