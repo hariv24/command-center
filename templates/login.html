@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>ThinkGalactic</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&family=JetBrains+Mono:wght@400;700&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+html,body{height:100%;background:#080808;font-family:'Outfit',system-ui,sans-serif;color:#f2f2f2}
+body{display:flex;align-items:center;justify-content:center;min-height:100vh}
+
+.wrap{width:100%;max-width:360px;padding:0 20px}
+
+.logo{display:flex;align-items:center;justify-content:center;gap:12px;margin-bottom:40px}
+.logo svg{width:36px;height:36px;color:#f2f2f2;opacity:.9}
+.logo-txt{text-align:left}
+.logo-name{font-size:14px;font-weight:700;letter-spacing:2px;text-transform:uppercase;line-height:1.2}
+.logo-sub{font-size:9px;color:#555;letter-spacing:2px;text-transform:uppercase;margin-top:2px}
+
+.mstripe{height:2px;background:linear-gradient(90deg,#0066b1,#1c69d4,#e22718);margin-bottom:28px}
+
+.card{background:#0e0e0e;border:1px solid rgba(255,255,255,.06);padding:28px}
+
+.field{margin-bottom:16px}
+.field label{display:block;font-size:8px;font-weight:700;letter-spacing:2.5px;text-transform:uppercase;color:#555;margin-bottom:6px}
+.field input{
+  width:100%;background:#080808;border:1px solid rgba(255,255,255,.06);color:#f2f2f2;
+  font-size:14px;padding:10px 13px;outline:none;font-family:'Outfit',sans-serif;
+  transition:border-color .15s;border-radius:0;-webkit-appearance:none;
+}
+.field input:focus{border-color:rgba(255,255,255,.16)}
+.field input::placeholder{color:#444}
+
+.err{background:rgba(232,64,64,.07);border:1px solid rgba(232,64,64,.2);padding:9px 12px;color:#e84040;font-size:12px;margin-bottom:16px;display:none}
+.err.on{display:block}
+
+.btn{
+  width:100%;background:#f2f2f2;color:#000;border:none;padding:11px;
+  font-size:10px;font-weight:700;letter-spacing:2px;text-transform:uppercase;
+  cursor:pointer;font-family:'Outfit',sans-serif;transition:opacity .15s;border-radius:0;
+  margin-top:4px;
+}
+.btn:hover{opacity:.85}.btn:active{transform:scale(.99)}
+
+.foot{text-align:center;margin-top:22px;font-size:10px;color:#333;letter-spacing:1.5px;text-transform:uppercase}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="logo">
+    <svg viewBox="0 0 32 32" fill="none">
+      <ellipse cx="16" cy="16" rx="13.5" ry="5" stroke="currentColor" stroke-width="1.5"/>
+      <ellipse cx="16" cy="16" rx="13.5" ry="5" stroke="currentColor" stroke-width="1.5" transform="rotate(60 16 16)"/>
+      <ellipse cx="16" cy="16" rx="13.5" ry="5" stroke="currentColor" stroke-width="1.5" transform="rotate(120 16 16)"/>
+      <circle cx="16" cy="16" r="2.5" fill="currentColor"/>
+    </svg>
+    <div class="logo-txt">
+      <div class="logo-name">ThinkGalactic</div>
+      <div class="logo-sub">Command Center</div>
+    </div>
+  </div>
+
+  <div class="mstripe"></div>
+
+  <div class="card">
+    <div class="err {% if error %}on{% endif %}" id="errmsg">{{ error or '' }}</div>
+    <form method="POST" action="/login">
+      <div class="field"><label>Username</label><input type="text" name="username" placeholder="" autocomplete="username" autofocus></div>
+      <div class="field"><label>Password</label><input type="password" name="password" placeholder="••••••••" autocomplete="current-password"></div>
+      <button class="btn" type="submit">Enter Command Center</button>
+    </form>
+  </div>
+
+  <div class="foot">Private · ThinkGalactic 2026</div>
+</div>
+</body>
+</html>

@@ -1,0 +1,41 @@
+# Environment & secrets
+.env
+credentials.json
+token.json
+
+# Personal data — never commit
+data/*.json
+sessions/
+briefs/
+profile.md
+
+# SSH & deploy keys
+key/
+
+# Brand assets
+Think_Galactic_Master.pdf
+DESIGN-bmw-m.md
+taste.md
+
+# Deploy script (contains server IP)
+deploy.sh
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+venv/
+.venv/
+*.egg-info/
+
+# Temp files
+.tmp/
+*.log
+
+# macOS
+.DS_Store
+
+# Keep directory structure
+!data/.gitkeep
+!sessions/.gitkeep
+!briefs/.gitkeep
