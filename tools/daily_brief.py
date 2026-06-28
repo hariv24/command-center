@@ -17,9 +17,49 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROFILE_PATH = Path(__file__).parent.parent / "profile.md"
-MODEL_HEAVY = "llama-3.3-70b-versatile"   # Board's Verdict — quality matters
-MODEL_FAST  = "llama-3.1-8b-instant"       # Story analyses — speed + token budget
-MODEL = MODEL_HEAVY  # default (kept for backwards compat)
+MODEL_HEAVY = "llama-3.3-70b-versatile"
+MODEL_FAST  = "llama-3.1-8b-instant"
+MODEL = MODEL_HEAVY
+
+TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+TOGETHER_BASE_URL = "https://api.together.xyz/v1"
+
+
+def _together_client():
+    key = os.getenv("TOGETHER_API_KEY")
+    if not key:
+        return None
+    try:
+        from openai import AsyncOpenAI
+        return AsyncOpenAI(api_key=key, base_url=TOGETHER_BASE_URL)
+    except ImportError:
+        return None
+
+
+async def _llm(groq_client, model, messages, max_tokens, temperature=0.7):
+    """Call Groq; on 429 fall back to Together.ai then Groq fast model."""
+    try:
+        r = await groq_client.chat.completions.create(
+            model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
+        )
+        return r.choices[0].message.content
+    except Exception as e:
+        if "rate_limit_exceeded" not in str(e):
+            raise
+    together = _together_client()
+    if together:
+        try:
+            r = await together.chat.completions.create(
+                model=TOGETHER_MODEL, messages=messages, max_tokens=max_tokens, temperature=temperature
+            )
+            return r.choices[0].message.content
+        except Exception:
+            pass
+    # Last resort — Groq fast model
+    r = await groq_client.chat.completions.create(
+        model=MODEL_FAST, messages=messages, max_tokens=max_tokens, temperature=temperature
+    )
+    return r.choices[0].message.content
 
 # Topic filters for relevance scoring
 AI_TECH_TOPICS = [
@@ -275,23 +315,7 @@ Write a long-form intelligence brief section. Structure:
 
 Make this comprehensive. A reader should fully understand this story and its implications from this section alone. Do not summarize. Explain."""
 
-    # Use the fast model for story analyses to stay within daily token budget.
-    # Fall back to heavy model if fast is also throttled.
-    for model in [MODEL_FAST, MODEL_HEAVY]:
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=900,
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            if "rate_limit_exceeded" in str(e) and model == MODEL_FAST:
-                print(f"  Fast model rate-limited, trying heavy model for story {story_idx}...")
-                continue
-            raise
-    raise RuntimeError("Both models rate-limited — try again later")
+    return await _llm(client, MODEL_FAST, [{"role": "user", "content": prompt}], max_tokens=900)
 
 
 async def generate_board_verdict(client, story_map, profile):
@@ -314,22 +338,7 @@ Write a "Board's Verdict" — as if Elon Musk, Jeff Bezos, Warren Buffett, Steve
 
 Be direct. Be specific. Write as if their future depends on this."""
 
-    # Board's Verdict uses the heavy model for quality; falls back to fast if throttled
-    for model in [MODEL_HEAVY, MODEL_FAST]:
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=600,
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            if "rate_limit_exceeded" in str(e) and model == MODEL_HEAVY:
-                print("  Heavy model rate-limited for Board's Verdict, falling back to fast model...")
-                continue
-            raise
-    raise RuntimeError("Both models rate-limited for Board's Verdict")
+    return await _llm(client, MODEL_HEAVY, [{"role": "user", "content": prompt}], max_tokens=600)
 
 
 async def run_daily_brief_async():

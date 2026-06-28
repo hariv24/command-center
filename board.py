@@ -19,6 +19,59 @@ SESSIONS_DIR = Path(__file__).parent / "sessions"
 KB_PATH = Path(__file__).parent / "data" / "knowledge_base.md"
 MODEL = "llama-3.3-70b-versatile"
 
+# Together.ai fallback — same model, different provider, separate daily limit.
+# Sign up at api.together.ai, add TOGETHER_API_KEY to .env.
+TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
+TOGETHER_BASE_URL = "https://api.together.xyz/v1"
+
+
+def _make_together_client():
+    """Return an OpenAI-compatible client pointed at Together.ai, or None if not configured."""
+    key = os.getenv("TOGETHER_API_KEY")
+    if not key:
+        return None
+    try:
+        from openai import AsyncOpenAI
+        return AsyncOpenAI(api_key=key, base_url=TOGETHER_BASE_URL)
+    except ImportError:
+        return None
+
+
+async def _call_with_fallback(primary_client, primary_model, messages, max_tokens, temperature):
+    """
+    Try Groq first. On 429, fall back to Together.ai (same quality, separate limit).
+    Falls back to Groq's fast 8b model if Together is also unavailable.
+    """
+    try:
+        r = await primary_client.chat.completions.create(
+            model=primary_model, messages=messages,
+            max_tokens=max_tokens, temperature=temperature
+        )
+        return r.choices[0].message.content
+    except Exception as e:
+        if "rate_limit_exceeded" not in str(e):
+            raise
+    # Groq 429 — try Together.ai
+    together = _make_together_client()
+    if together:
+        try:
+            r = await together.chat.completions.create(
+                model=TOGETHER_MODEL, messages=messages,
+                max_tokens=max_tokens, temperature=temperature
+            )
+            return r.choices[0].message.content
+        except Exception:
+            pass
+    # Last resort — Groq fast model
+    try:
+        r = await primary_client.chat.completions.create(
+            model=ROUTER_MODEL, messages=messages,
+            max_tokens=max_tokens, temperature=temperature
+        )
+        return r.choices[0].message.content
+    except Exception:
+        raise RuntimeError("rate_limit_exceeded")
+
 BOARD = {
     "Elon Musk": {
         "role": "First Principles Thinker & Moonshot Builder",
@@ -573,23 +626,12 @@ Be specific to their situation — reference past decisions above if relevant.
 Challenge them where their thinking is weak. Give one concrete action they can take this week.
 Speak directly. Under 350 words."""
 
-    for model in [MODEL, ROUTER_MODEL]:
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[
-                    {"role": "system", "content": config["system"]},
-                    {"role": "user", "content": prompt}
-                ],
-                max_tokens=700,
-                temperature=0.9
-            )
-            return name, config["role"], config["color"], response.choices[0].message.content
-        except Exception as e:
-            if "rate_limit_exceeded" in str(e) and model == MODEL:
-                continue
-            raise
-    raise RuntimeError("rate_limit_exceeded")
+    content = await _call_with_fallback(
+        client, MODEL,
+        messages=[{"role": "system", "content": config["system"]}, {"role": "user", "content": prompt}],
+        max_tokens=700, temperature=0.9
+    )
+    return name, config["role"], config["color"], content
 
 
 async def _get_synthesis(client, question, responses):
@@ -612,20 +654,11 @@ Synthesize — under 250 words, 3 sections:
 
 **The one move this week:** (one specific, concrete action — not a direction, an actual task with a deadline)"""
 
-    for model in [MODEL, ROUTER_MODEL]:
-        try:
-            response = await client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                max_tokens=500,
-                temperature=0.7
-            )
-            return response.choices[0].message.content
-        except Exception as e:
-            if "rate_limit_exceeded" in str(e) and model == MODEL:
-                continue
-            raise
-    raise RuntimeError("rate_limit_exceeded")
+    return await _call_with_fallback(
+        client, MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=500, temperature=0.7
+    )
 
 
 ROUTER_MODEL = "llama-3.1-8b-instant"  # Fast + cheap for routing decisions
