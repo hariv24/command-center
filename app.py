@@ -19,6 +19,7 @@ load_dotenv(Path(__file__).parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent))
 from board import run_board, list_sessions, get_session, get_quick_response, _load_recs, _save_recs, run_followup_async
+from llm import call_llm
 from tools.daily_brief import run_daily_brief_async
 
 app = Flask(__name__)
@@ -134,6 +135,42 @@ def _build_live_context(include_goals=True, include_decisions=True,
         if unactioned:
             lines = [f"- \"{r.get('recommendation','')[:100]}\" ({r.get('date','')})" for r in unactioned[-3:]]
             parts.append(f"UNACTIONED BOARD RECOMMENDATIONS ({len(unactioned)} total):\n" + "\n".join(lines))
+        # Ignored advice — pending for over a week. Advisors call this out.
+        def _age_days(r):
+            try:
+                return (today - date.fromisoformat(r.get("date", ""))).days
+            except Exception:
+                return 0
+        old = [r for r in unactioned if _age_days(r) > 7]
+        if old:
+            lines = [
+                f"- [{r.get('date','')}] {r.get('advisor','Board')}: \"{r.get('recommendation','')[:100]}\" "
+                f"({r.get('timeframe','')} — still not done after {_age_days(r)} days)"
+                for r in old[-3:]
+            ]
+            parts.append("UNACTED ADVICE (7+ DAYS OLD — advice given and ignored):\n" + "\n".join(lines))
+
+    # Wellness state — synthesized from coaching conversations
+    wb = load_json(WELLNESS_BRIEF_FILE) if WELLNESS_BRIEF_FILE.exists() else {}
+    if isinstance(wb, dict) and wb.get("content"):
+        parts.append(f"WELLNESS STATE (updated {wb.get('date','')}):\n{wb['content'][:500]}")
+
+    # Active convictions — what he claims to believe
+    convictions = load_json(CONVICTIONS_FILE)
+    active_conv = [c for c in convictions if c.get("status") == "active"]
+    if active_conv:
+        lines = [f"- \"{c.get('thesis','')[:100]}\" (strength {c.get('strength','?')}/10)" for c in active_conv[-3:]]
+        parts.append("HIS STATED CONVICTIONS:\n" + "\n".join(lines))
+
+    # Time allocation this week — where hours actually went
+    week_start = (today - timedelta(days=today.weekday())).isoformat()
+    week_time = [l for l in load_json(TIME_FILE) if l.get("date", "") >= week_start]
+    if week_time:
+        by_cat = {}
+        for l in week_time:
+            by_cat[l.get("category", "Other")] = by_cat.get(l.get("category", "Other"), 0) + float(l.get("hours", 0))
+        summary = " · ".join(f"{k}: {v:.1f}h" for k, v in sorted(by_cat.items(), key=lambda x: -x[1]))
+        parts.append(f"TIME THIS WEEK: {summary}")
 
     if not parts:
         return ""
@@ -433,7 +470,6 @@ def time_summary():
 @app.route("/api/time/parse", methods=["POST"])
 def parse_time_natural():
     """Parse a natural language daily summary into structured time log entries."""
-    from groq import AsyncGroq as _AsyncGroq
     import asyncio as _asyncio
 
     d = request.get_json()
@@ -444,8 +480,6 @@ def parse_time_natural():
     date = d.get("date", datetime.now().strftime("%Y-%m-%d"))
 
     async def _parse():
-        api_key = os.getenv("GROQ_API_KEY")
-        client = _AsyncGroq(api_key=api_key)
         prompt = f"""Extract time log entries from this daily summary.
 
 Text: "{text}"
@@ -456,13 +490,11 @@ Return ONLY a JSON array of entries. Each entry: {{"category": "...", "hours": 2
 If you can't parse a time, make a reasonable estimate (30min meeting = 0.5, "couple hours" = 2).
 Example output: [{{"category": "Agency Work", "hours": 3, "task": "Shakti ERP invoice module"}}, {{"category": "Gym/Health", "hours": 1, "task": "gym"}}]"""
 
-        resp = await client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=300,
-            temperature=0.1
+        raw = await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="fast", max_tokens=300, temperature=0.1
         )
-        return resp.choices[0].message.content.strip()
+        return raw.strip()
 
     try:
         raw = _asyncio.run(_parse())
@@ -494,7 +526,6 @@ Example output: [{{"category": "Agency Work", "hours": 3, "task": "Shakti ERP in
 @app.route("/api/expenses/import", methods=["POST"])
 def import_bank_statement():
     """Parse uploaded bank statement CSV and auto-categorize transactions."""
-    from groq import AsyncGroq as _AsyncGroq
     import asyncio as _asyncio
     import csv, io
 
@@ -523,8 +554,6 @@ def import_bank_statement():
     transactions_text = "\n".join(lines[:80])  # limit tokens
 
     async def _categorize():
-        api_key = os.getenv("GROQ_API_KEY")
-        client = _AsyncGroq(api_key=api_key)
         prompt = f"""You are parsing an Indian bank statement CSV for Hariv, a 23-year-old founder.
 
 CSV content (first 80 rows):
@@ -542,13 +571,11 @@ Rules:
 - Swiggy/Zomato = Food, Ola/Uber = Transport, AWS/Groq/SaaS = Subscriptions, gym = Health
 - If amount is negative (debit format), make it positive"""
 
-        resp = await client.chat.completions.create(
-            model="llama-3.1-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=2000,
-            temperature=0.1
+        raw = await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="heavy", max_tokens=2000, temperature=0.1
         )
-        return resp.choices[0].message.content.strip()
+        return raw.strip()
 
     try:
         raw = _asyncio.run(_categorize())
@@ -621,7 +648,7 @@ You are not a therapist. You are not a coach. You are them — older, clearer, a
 def _update_wellness_brief():
     """Synthesize the full vitals conversation into a wellness brief. Runs in background."""
     try:
-        from groq import Groq as _Groq
+        import asyncio as _asyncio
         vitals = load_json(VITALS_FILE)
         if len(vitals) < 2:
             return
@@ -630,7 +657,6 @@ def _update_wellness_brief():
             f"Hariv: {v['user']}\nCoach: {v['coach']}"
             for v in recent if v.get('user') and v.get('coach')
         ])
-        client = _Groq(api_key=os.environ.get("GROQ_API_KEY"))
         prompt = f"""Based on these wellness conversations with Hariv (23yo Indian founder), write a concise wellness brief (4-6 sentences) covering:
 - Current energy level and trend
 - Sleep quality and physical state (gym, exercise)
@@ -643,12 +669,10 @@ Conversations:
 
 Write a specific, factual brief. Use direct language. No filler. This will be read by an AI to personalize Hariv's daily briefs."""
 
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=250, temperature=0.3
-        )
-        content = resp.choices[0].message.content.strip()
+        content = _asyncio.run(call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="fast", max_tokens=250, temperature=0.3
+        )).strip()
         save_json(WELLNESS_BRIEF_FILE, {
             "date": datetime.now().strftime("%Y-%m-%d"),
             "updated": datetime.now().isoformat(),
@@ -661,7 +685,6 @@ Write a specific, factual brief. Use direct language. No filler. This will be re
 
 @app.route("/api/vitals/chat", methods=["POST"])
 def vitals_chat():
-    from groq import AsyncGroq as _AsyncGroq
     import asyncio as _asyncio
 
     d = request.get_json()
@@ -728,9 +751,6 @@ def vitals_chat():
     cross_context = "\n\n".join(cross_context_parts)
 
     async def _respond():
-        api_key = os.getenv("GROQ_API_KEY")
-        client = _AsyncGroq(api_key=api_key)
-
         system = WELLNESS_SYSTEM
         if cross_context:
             system += f"\n\n--- WHAT YOU ALREADY KNOW (from the rest of the system) ---\n{cross_context}\n--- Use this naturally. Don't recite it. Only reference it if it's genuinely relevant. ---"
@@ -745,13 +765,7 @@ def vitals_chat():
         else:
             messages.append({"role": "user", "content": message})
 
-        resp = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=500,
-            temperature=0.8
-        )
-        return resp.choices[0].message.content
+        return await call_llm(messages, tier="heavy", max_tokens=500, temperature=0.8)
 
     try:
         coach_response = _asyncio.run(_respond())
@@ -783,7 +797,6 @@ def vitals_history():
 @app.route("/api/vitals/insights", methods=["GET"])
 def vitals_insights():
     """Weekly pattern synthesis across all vitals check-ins."""
-    from groq import AsyncGroq as _AsyncGroq
     import asyncio as _asyncio
 
     vitals = load_json(VITALS_FILE)
@@ -797,8 +810,6 @@ def vitals_insights():
     )
 
     async def _analyze():
-        api_key = os.getenv("GROQ_API_KEY")
-        client = _AsyncGroq(api_key=api_key)
         prompt = f"""Analyze Hariv's wellness check-ins for patterns. He's a 23-year-old founder — physical and mental state directly affects his output.
 
 Recent check-ins:
@@ -813,13 +824,10 @@ Write a pattern analysis:
 
 Be specific. Reference actual things he said. No generic advice."""
 
-        resp = await client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=600,
-            temperature=0.7
+        return await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="heavy", max_tokens=600, temperature=0.7
         )
-        return resp.choices[0].message.content
 
     try:
         insights = _asyncio.run(_analyze())
@@ -1017,16 +1025,23 @@ START with a specific, widely-held belief to react to. Keep responses SHORT (2-3
 @app.route("/api/conviction-train/chat", methods=["POST"])
 def conviction_train_chat():
     """Conviction training conversation — builds the muscle of independent thinking."""
-    from groq import Groq as _Groq
+    import asyncio as _asyncio
     d = request.get_json()
     message = d.get("message", "").strip()
     is_start = d.get("start", False)
 
     chat_history = load_json(CONVICTION_CHAT_FILE) if not is_start else []
 
-    client = _Groq(api_key=os.environ.get("GROQ_API_KEY"))
+    # Shared live context — same picture of Hariv the board and coaches see
+    system = CONVICTION_COACH_SYSTEM
+    try:
+        live_ctx = _build_live_context()
+        if live_ctx:
+            system += f"\n\n--- WHAT YOU ALREADY KNOW (from the rest of his command center) ---\n{live_ctx}\n--- Use this to pick beliefs that actually matter to his current situation. Don't recite it. ---"
+    except Exception:
+        pass
 
-    messages = [{"role": "system", "content": CONVICTION_COACH_SYSTEM}]
+    messages = [{"role": "system", "content": system}]
     for h in chat_history[-20:]:
         messages.append({"role": "user", "content": h["user"]})
         messages.append({"role": "assistant", "content": h["coach"]})
@@ -1036,13 +1051,9 @@ def conviction_train_chat():
     messages.append({"role": "user", "content": message})
 
     try:
-        resp = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=messages,
-            max_tokens=300,
-            temperature=0.9
-        )
-        coach_reply = resp.choices[0].message.content.strip()
+        coach_reply = _asyncio.run(call_llm(
+            messages, tier="heavy", max_tokens=300, temperature=0.9
+        )).strip()
         chat_history.append({"user": message, "coach": coach_reply, "timestamp": datetime.now().isoformat()})
         save_json(CONVICTION_CHAT_FILE, chat_history)
         return jsonify({"response": coach_reply, "turn": len(chat_history)})
@@ -1058,13 +1069,12 @@ def conviction_train_history():
 @app.route("/api/conviction-train/extract", methods=["POST"])
 def conviction_train_extract():
     """Extract strong convictions from the conversation and store them."""
-    from groq import Groq as _Groq
+    import asyncio as _asyncio
     chat_history = load_json(CONVICTION_CHAT_FILE)
     if len(chat_history) < 3:
         return jsonify({"error": "Have more of a conversation first"}), 400
 
     convo = "\n".join([f"Hariv: {h['user']}\nCoach: {h['coach']}" for h in chat_history[-20:]])
-    client = _Groq(api_key=os.environ.get("GROQ_API_KEY"))
 
     prompt = f"""From this conviction training conversation, extract any genuinely contrarian beliefs that Hariv expressed and defended with his own reasoning (not just agreed with the coach).
 
@@ -1076,12 +1086,10 @@ Only include beliefs where Hariv pushed back against consensus or defended a non
 Return ONLY valid JSON, no explanation."""
 
     try:
-        resp = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500, temperature=0.2
-        )
-        raw = resp.choices[0].message.content.strip()
+        raw = _asyncio.run(call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="fast", max_tokens=500, temperature=0.2
+        )).strip()
         import json as _json, re as _re
         match = _re.search(r'\[.*\]', raw, _re.DOTALL)
         extracted = _json.loads(match.group()) if match else []
@@ -1172,7 +1180,6 @@ def update_kb():
 # ── Weekly Retrospective ───────────────────────────────────────
 @app.route("/api/retrospective", methods=["POST"])
 def retrospective():
-    from groq import AsyncGroq as _AsyncGroq
     import asyncio as _asyncio
     from datetime import date, timedelta
 
@@ -1216,8 +1223,6 @@ VITALS CHECK-INS ({len(vitals_this_week)}):
 {chr(10).join(v.get("user", "")[:150] for v in vitals_this_week[:5])}"""
 
     async def _generate():
-        api_key = os.getenv("GROQ_API_KEY")
-        client = _AsyncGroq(api_key=api_key)
         prompt = f"""Write a weekly retrospective for Hariv — 23-year-old Indian founder, goal: NYC, billionaire. Be direct. No filler.
 
 {context}
@@ -1244,16 +1249,12 @@ Structure:
 
 Be specific. Reference actual numbers and decisions from the data. Under 400 words."""
 
-        resp = await client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=700,
-            temperature=0.7
+        return await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="heavy", max_tokens=700, temperature=0.7
         )
-        return resp.choices[0].message.content
 
     try:
-        from board import MODEL
         result = _asyncio.run(_generate())
         # Save retrospective to briefs dir
         retro_path = BRIEFS_DIR / f"retro_{today.isoformat()}.md"
@@ -1269,7 +1270,6 @@ def opportunity_scan():
     """Scan for specific opportunities relevant to Hariv's businesses."""
     import asyncio as _asyncio
     from tools.daily_brief import fetch_hn_stories, fetch_reddit_posts_with_comments, is_relevant
-    from groq import AsyncGroq as _AsyncGroq
 
     SCAN_TOPICS = [
         "vertical SaaS India", "manufacturing software India", "ERP automation India",
@@ -1281,9 +1281,6 @@ def opportunity_scan():
     ]
 
     async def _scan():
-        api_key = os.getenv("GROQ_API_KEY")
-        client = _AsyncGroq(api_key=api_key)
-
         hn = fetch_hn_stories(50)
         reddit = []
         for sub in ["SaaS", "startups", "indianstartups", "entrepreneur"]:
@@ -1332,16 +1329,12 @@ Write a SHORT opportunity scan report:
 
 Be specific. Under 300 words."""
 
-        resp = await client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=600,
-            temperature=0.7
+        return await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="heavy", max_tokens=600, temperature=0.7
         )
-        return resp.choices[0].message.content
 
     try:
-        from board import MODEL
         result = _asyncio.run(_scan())
         return jsonify({"scan": result})
     except Exception as ex:
@@ -1388,6 +1381,36 @@ def home_data():
     # Board recommendations pending
     pending_recs = len([r for r in _load_recs() if r.get("status") == "pending"])
 
+    # Goal velocity — is measurable progress happening on each active goal?
+    goals = load_json(GOALS_FILE)
+    two_weeks_ago = (today - timedelta(days=14)).isoformat()
+    recent_time = [l for l in load_json(TIME_FILE) if l.get("date", "") >= two_weeks_ago]
+    recent_decs = [d for d in load_json(DECISIONS_FILE) if d.get("date", "") >= two_weeks_ago]
+    recent_log_text = " ".join(
+        (l.get("did", "") + " " + l.get("tomorrow", "")).lower()
+        for l in logs if l.get("date", "") >= two_weeks_ago
+    )
+    goal_velocity = {}
+    for g in goals:
+        if g.get("status") != "active":
+            continue
+        gid = g.get("id", g.get("title", ""))
+        keywords = [w for w in re.split(r"\W+", g.get("title", "").lower()) if len(w) > 3]
+        hours = sum(float(l.get("hours", 0)) for l in recent_time if l.get("goal_id") == g.get("id"))
+        mentions = sum(recent_log_text.count(k) for k in keywords)
+        decisions = sum(
+            1 for d in recent_decs
+            if any(k in d.get("decision", "").lower() for k in keywords)
+        )
+        signal = hours + mentions * 0.5 + decisions
+        goal_velocity[gid] = {
+            "title": g.get("title", ""),
+            "hours_14d": round(hours, 1),
+            "log_mentions_14d": mentions,
+            "decisions_14d": decisions,
+            "velocity": "moving" if signal >= 3 else ("slow" if signal > 0 else "stalled"),
+        }
+
     return jsonify({
         "today": today.isoformat(),
         "mode": "morning" if datetime.now().hour < 14 else "evening",
@@ -1404,6 +1427,7 @@ def home_data():
         "momentum_total_hrs": round(total_hrs, 1),
         "log_streak": streak,
         "pending_recs": pending_recs,
+        "goal_velocity": goal_velocity,
     })
 
 
@@ -1469,12 +1493,8 @@ def get_weekly_synthesis():
 
 def _generate_weekly_synthesis():
     """Pull from all 8 modules and synthesize the week's real patterns."""
-    from groq import Groq as _Groq
+    import asyncio as _asyncio
     from datetime import date, timedelta
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        return
-    client = _Groq(api_key=api_key)
     today = date.today()
     week_start = (today - timedelta(days=7)).isoformat()
 
@@ -1574,13 +1594,10 @@ Write a weekly synthesis. Be direct, specific, and honest. Structure:
 
 Write as someone who has seen all the data and sees the full picture. Not harsh, not gentle — just clear."""
 
-    response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=800,
-        temperature=0.7
-    )
-    content = response.choices[0].message.content.strip()
+    content = _asyncio.run(call_llm(
+        [{"role": "user", "content": prompt}],
+        tier="heavy", max_tokens=800, temperature=0.7
+    )).strip()
 
     BRIEFS_DIR.mkdir(exist_ok=True)
     out_file = BRIEFS_DIR / f"weekly_{today.isoformat()}.md"
@@ -1591,7 +1608,6 @@ Write as someone who has seen all the data and sees the full picture. Not harsh,
 
 @app.route("/api/home/morning", methods=["POST"])
 def morning_brief():
-    from groq import AsyncGroq as _AsyncGroq
     import asyncio as _asyncio
     from datetime import date, timedelta
 
@@ -1709,8 +1725,6 @@ GOALS: {json.dumps([{"title":g["title"],"current":g.get("current",""),"target":g
 {f"UNACTIONED BOARD RECS ({len(unactioned_recs)}): " + " | ".join(r.get("recommendation","")[:60] for r in unactioned_recs[:3]) if unactioned_recs else ""}"""
 
     async def _gen():
-        from board import MODEL as _M
-        client = _AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
         prompt = f"""Write Hariv's morning brief. First thing he reads when he wakes up. Personal, direct, specific — not generic advice. If there are ACCOUNTABILITY FLAGS above, open with them. Don't soften them.
 
 {ctx}
@@ -1741,10 +1755,10 @@ Structure:
 
 Under 400 words. Direct. No filler."""
 
-        resp = await client.chat.completions.create(
-            model=_M, messages=[{"role":"user","content":prompt}], max_tokens=750, temperature=0.75
+        return await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="heavy", max_tokens=750, temperature=0.75
         )
-        return resp.choices[0].message.content
 
     try:
         result = _asyncio.run(_gen())
@@ -1761,7 +1775,6 @@ Under 400 words. Direct. No filler."""
 
 @app.route("/api/home/evening", methods=["POST"])
 def evening_reflection():
-    from groq import AsyncGroq as _AsyncGroq
     import asyncio as _asyncio
     from datetime import date, timedelta
 
@@ -1817,8 +1830,6 @@ WELLNESS BRIEF (synthesized from all coaching conversations{f', updated {wellnes
 Total logged: {sum(by_cat.values()):.1f}h"""
 
     async def _gen():
-        from board import MODEL as _M
-        client = _AsyncGroq(api_key=os.getenv("GROQ_API_KEY"))
         prompt = f"""Write Hariv's evening reflection. He reads this before sleep. NOT news. High-level, honest, strategic. Make him think. Be direct. This feeds into tomorrow's morning brief — so name what needs to change.
 
 {ctx}
@@ -1844,10 +1855,10 @@ Structure:
 
 Under 320 words. No filler. The quality of this determines the quality of tomorrow's morning brief."""
 
-        resp = await client.chat.completions.create(
-            model=_M, messages=[{"role":"user","content":prompt}], max_tokens=580, temperature=0.8
+        return await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="heavy", max_tokens=580, temperature=0.8
         )
-        return resp.choices[0].message.content
 
     try:
         result = _asyncio.run(_gen())

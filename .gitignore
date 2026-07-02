@@ -5,6 +5,7 @@ token.json
 
 # Personal data — never commit
 data/*.json
+data/*.md
 sessions/
 briefs/
 profile.md

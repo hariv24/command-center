@@ -11,66 +11,14 @@ import html
 import urllib.request
 from pathlib import Path
 from datetime import datetime
-from groq import AsyncGroq
 from dotenv import load_dotenv
+
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from llm import call_llm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
 
 PROFILE_PATH = Path(__file__).parent.parent / "profile.md"
-MODEL_HEAVY = "llama-3.3-70b-versatile"
-MODEL_FAST  = "llama-3.1-8b-instant"
-MODEL = MODEL_HEAVY
-
-TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-TOGETHER_BASE_URL = "https://api.together.xyz/v1"
-
-
-def _groq_clients():
-    clients = []
-    for var in ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3"]:
-        key = os.getenv(var)
-        if key:
-            clients.append(AsyncGroq(api_key=key))
-    return clients
-
-
-def _together_client():
-    key = os.getenv("TOGETHER_API_KEY")
-    if not key:
-        return None
-    try:
-        from openai import AsyncOpenAI
-        return AsyncOpenAI(api_key=key, base_url=TOGETHER_BASE_URL)
-    except ImportError:
-        return None
-
-
-async def _llm(groq_client, model, messages, max_tokens, temperature=0.7):
-    """Try all Groq keys, then Together.ai, then Groq fast model."""
-    clients = _groq_clients() or [groq_client]
-    for client in clients:
-        try:
-            r = await client.chat.completions.create(
-                model=model, messages=messages, max_tokens=max_tokens, temperature=temperature
-            )
-            return r.choices[0].message.content
-        except Exception as e:
-            if "rate_limit_exceeded" in str(e):
-                continue
-            raise
-    together = _together_client()
-    if together:
-        try:
-            r = await together.chat.completions.create(
-                model=TOGETHER_MODEL, messages=messages, max_tokens=max_tokens, temperature=temperature
-            )
-            return r.choices[0].message.content
-        except Exception:
-            pass
-    r = await clients[0].chat.completions.create(
-        model=MODEL_FAST, messages=messages, max_tokens=max_tokens, temperature=temperature
-    )
-    return r.choices[0].message.content
 
 # Topic filters for relevance scoring
 AI_TECH_TOPICS = [
@@ -291,7 +239,7 @@ def format_story_for_prompt(story, category, desc):
     return "\n".join(lines)
 
 
-async def analyze_story(client, story, category, category_desc, story_idx, profile=""):
+async def analyze_story(story, category, category_desc, story_idx, profile=""):
     story_text = format_story_for_prompt(story, category, category_desc)
     profile_ctx = profile[:400] if profile else "An ambitious founder building toward a big goal."
 
@@ -326,10 +274,10 @@ Write a long-form intelligence brief section. Structure:
 
 Make this comprehensive. A reader should fully understand this story and its implications from this section alone. Do not summarize. Explain."""
 
-    return await _llm(client, MODEL_HEAVY, [{"role": "user", "content": prompt}], max_tokens=1000)
+    return await call_llm([{"role": "user", "content": prompt}], tier="heavy", max_tokens=1000, temperature=0.7)
 
 
-async def generate_board_verdict(client, story_map, profile):
+async def generate_board_verdict(story_map, profile):
     stories_summary = "\n".join(
         f"- [{cat}] {s['title']} ({s['source']}, {s['score']} pts)"
         for cat, s in story_map.items()
@@ -349,13 +297,12 @@ Write a "Board's Verdict" — as if Elon Musk, Jeff Bezos, Warren Buffett, Steve
 
 Be direct. Be specific. Write as if their future depends on this."""
 
-    return await _llm(client, MODEL_HEAVY, [{"role": "user", "content": prompt}], max_tokens=600)
+    return await call_llm([{"role": "user", "content": prompt}], tier="heavy", max_tokens=600, temperature=0.7)
 
 
 async def run_daily_brief_async():
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY not set in .env")
+    if not any(os.getenv(v) for v in ("OPENROUTER_API_KEY", "GROQ_API_KEY", "TOGETHER_API_KEY")):
+        raise ValueError("No LLM API key set (OPENROUTER_API_KEY / GROQ_API_KEY) in .env")
 
     profile = PROFILE_PATH.read_text() if PROFILE_PATH.exists() else ""
 
@@ -373,8 +320,6 @@ async def run_daily_brief_async():
                 )
         except Exception:
             pass
-
-    client = AsyncGroq(api_key=api_key)
 
     print("  Fetching HN stories + comments...")
     hn_stories = fetch_hn_stories(80)
@@ -406,11 +351,11 @@ async def run_daily_brief_async():
     full_profile = (profile + ("\n\n" + goals_ctx if goals_ctx else "")).strip()
 
     analysis_tasks = [
-        analyze_story(client, story, cat, CATEGORIES[cat], idx + 1, full_profile)
+        analyze_story(story, cat, CATEGORIES[cat], idx + 1, full_profile)
         for idx, (cat, story) in enumerate(story_map.items())
     ]
     analyses = await asyncio.gather(*analysis_tasks)
-    board_verdict = await generate_board_verdict(client, story_map, full_profile)
+    board_verdict = await generate_board_verdict(story_map, full_profile)
 
     date_str = datetime.now().strftime("%A, %B %d %Y")
     sections = [

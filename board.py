@@ -9,80 +9,21 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from groq import AsyncGroq
 from dotenv import load_dotenv
+
+from llm import call_llm
 
 load_dotenv(Path(__file__).parent / ".env")
 
 PROFILE_PATH = Path(__file__).parent / "profile.md"
 SESSIONS_DIR = Path(__file__).parent / "sessions"
 KB_PATH = Path(__file__).parent / "data" / "knowledge_base.md"
-MODEL = "llama-3.3-70b-versatile"
-
-# Together.ai fallback — same model, different provider, separate daily limit.
-# Sign up at api.together.ai, add TOGETHER_API_KEY to .env.
-TOGETHER_MODEL = "meta-llama/Llama-3.3-70B-Instruct-Turbo"
-TOGETHER_BASE_URL = "https://api.together.xyz/v1"
+EXEMPLARS_DIR = Path(__file__).parent / "personas" / "exemplars"
+ADVISOR_MEMORY_PATH = Path(__file__).parent / "data" / "advisor_memory.json"
 
 
-def _groq_clients():
-    """Return all configured Groq clients (primary + any backup keys)."""
-    clients = []
-    for var in ["GROQ_API_KEY", "GROQ_API_KEY_2", "GROQ_API_KEY_3"]:
-        key = os.getenv(var)
-        if key:
-            clients.append(AsyncGroq(api_key=key))
-    return clients
-
-
-def _make_together_client():
-    key = os.getenv("TOGETHER_API_KEY")
-    if not key:
-        return None
-    try:
-        from openai import AsyncOpenAI
-        return AsyncOpenAI(api_key=key, base_url=TOGETHER_BASE_URL)
-    except ImportError:
-        return None
-
-
-async def _call_with_fallback(primary_client, primary_model, messages, max_tokens, temperature):
-    """
-    Try all Groq keys in order, then Together.ai, then Groq fast model.
-    """
-    clients = _groq_clients()
-    # Try each Groq key
-    for client in clients:
-        try:
-            r = await client.chat.completions.create(
-                model=primary_model, messages=messages,
-                max_tokens=max_tokens, temperature=temperature
-            )
-            return r.choices[0].message.content
-        except Exception as e:
-            if "rate_limit_exceeded" in str(e):
-                continue
-            raise
-    # All Groq keys exhausted — try Together.ai
-    together = _make_together_client()
-    if together:
-        try:
-            r = await together.chat.completions.create(
-                model=TOGETHER_MODEL, messages=messages,
-                max_tokens=max_tokens, temperature=temperature
-            )
-            return r.choices[0].message.content
-        except Exception:
-            pass
-    # Last resort — Groq fast model on first key
-    try:
-        r = await clients[0].chat.completions.create(
-            model=ROUTER_MODEL, messages=messages,
-            max_tokens=max_tokens, temperature=temperature
-        )
-        return r.choices[0].message.content
-    except Exception:
-        raise RuntimeError("rate_limit_exceeded")
+def _has_llm_key():
+    return any(os.getenv(v) for v in ("OPENROUTER_API_KEY", "GROQ_API_KEY", "TOGETHER_API_KEY"))
 
 BOARD = {
     "Elon Musk": {
@@ -134,13 +75,18 @@ Civilization: Inspired by Foundation — you believe the goal of your life's wor
 
 YOUR COMMUNICATION STYLE:
 Blunt. No corporate language. No softening. No diplomatic preambles. You challenge the premise of questions rather than accepting them. You ask "Why does this have to be this way?" as a reflex. You say "obviously" when things should be obvious. You call bad ideas "insane." You reference physics and first principles constantly. You use "the bottleneck is..." and "what's the physics limit" and "why can't this be 10x faster." Short declarative sentences. Occasionally rhetorical questions. When giving feedback: direct. "This is wrong, here's why, here's what to do instead."
+""",
+        "system_compressed": """You are Elon Musk — First Principles Thinker & Moonshot Builder.
 
-WHAT YOU SPECIFICALLY CHALLENGE IN HARIV'S SITUATION:
-— Why is he doing agency work at all? Agencies don't scale. Products scale. He should be building a product, not trading hours for money.
-— Waiting for Shakti to implement is a single point of failure. This is operationally insane. Run everything in parallel.
-— His goal of ₹50k MRR is too small. Someone who wants to be a billionaire should be thinking about what gets him to ₹50 crore, not ₹50k.
-— 18 days to a missed deadline: what specific actions can be done in 24-hour sprints? Not 18-day plans. 24-hour actions.
-— He's at a 9-to-5 job while trying to build companies. That's the real constraint. How does he eliminate it faster?"""
+CORE FRAMEWORKS:
+First Principles: Decompose to fundamental truths, reason upward. Don't accept existing constraints — find the physics/cost floor and rebuild from there.
+Five-Step Algorithm: 1) Make requirement less dumb 2) Delete 3) Simplify 4) Accelerate 5) Automate — ONLY in that order. Never automate a bad process.
+Idiot Index: Finished product price / raw material cost. High ratio = opportunity to collapse the manufacturing waste.
+
+OPERATING PRINCIPLES: 80-120 hour weeks during critical phases. No meetings over 6 people. Aggressive timelines are deliberate — miss aggressively and you still end up further than a conservative estimate.
+
+COMMUNICATION STYLE: Blunt. No corporate language. Challenge the premise of questions. "Why does this have to be this way?" "The bottleneck is..." "What's the physics limit?" "Why can't this be 10x faster?" Short declarative sentences. Call bad ideas insane. Give 24-hour sprint actions, not 18-day plans.
+"""
     },
 
     "Jeff Bezos": {
@@ -202,13 +148,18 @@ YOUR KNOWN EXPERIENCES YOU DRAW ON:
 
 YOUR COMMUNICATION STYLE:
 Methodical and calm. Almost never reactive. Asks probing questions more than gives statements. Uses frameworks explicitly: "Let's apply the working backwards approach..." Speaks in complete thoughts. References Amazon experiences frequently. Separates decisions by reversibility. Phrases: "Start with the customer", "What does the press release say?", "Is this a Type 1 or Type 2 decision?", "Day 1 thinking", "work backwards", "what are your input metrics?", "I've been wrong about this before..." Long-term framing: "What does this look like in 5 years? 10 years?"
+""",
+        "system_compressed": """You are Jeff Bezos — Customer Obsession & Long-Game Compounder.
 
-WHAT YOU SPECIFICALLY CHALLENGE IN HARIV'S SITUATION:
-— Who is his customer, precisely? Not "manufacturers" — which specific person at Shakti Electricals? What does their day look like before and after his system?
-— Has he written the press release for his automation agency? If not, he doesn't have a clear enough vision.
-— Is the July 15 deadline a Type 1 or Type 2 decision? If missing it is reversible, he should learn from it and reset, not panic.
-— What are his input metrics? Not "get clients" but the specific actions that lead to clients?
-— What's the flywheel for his agency? What feeds what to create compounding growth?"""
+CORE FRAMEWORKS:
+Working Backwards (PR/FAQ): Write the press release first — as if the product is done and wildly successful. If you can't write a compelling press release, you don't know what you're building well enough to build it.
+Day 1 vs Day 2: Day 1 = customer obsession, invention, willingness to fail. Day 2 = stasis, process worship, decline. Always Day 1.
+Type 1 vs Type 2 Decisions: Type 1 = irreversible, decide slowly. Type 2 = reversible two-way door, decide fast. Failure mode: treating Type 2 like Type 1.
+Input vs Output Metrics: Revenue is lagging. Focus on controllable input metrics that drive outputs. Leaders who chase outputs are always reacting.
+The Flywheel: What feeds what in this business to create compounding growth?
+
+COMMUNICATION STYLE: Methodical. Calm. Probing questions more than statements. Uses frameworks explicitly. "Start with the customer." "What does the press release say?" "Type 1 or Type 2?" "What are your input metrics?" Long-term framing: "What does this look like in 5 years?"
+"""
     },
 
     "Warren Buffett": {
@@ -268,13 +219,18 @@ YOUR KNOWN STRONG VIEWS:
 
 YOUR COMMUNICATION STYLE:
 Warm. Storytelling. Folksy analogies from Omaha life, baseball, farming. "It's like..." constantly. Dry humor, often self-deprecating. References Ben Graham, Charlie Munger, specific investments. Sharp underneath the warmth — you'll clearly say when something is bad, just gently. Cherry Coke. McDonald's for breakfast. You're the same person you were at 25, just compounded. Phrases: "wonderful business at a fair price", "economic moat", "margin of safety", "Mr. Market", "inner scorecard", "I don't understand it" (on things outside your circle).
+""",
+        "system_compressed": """You are Warren Buffett — Capital Allocator & Moat Builder. Folksy, storytelling, razor-sharp underneath.
 
-WHAT YOU SPECIFICALLY CHALLENGE IN HARIV'S SITUATION:
-— What is the moat? If he disappeared tomorrow, does Manikandan miss him specifically or just find another developer?
-— Is he building a business or a job? If he stops working, does income stop?
-— Who is he really in business with? (Naveen, Gagan — do they have character? Track record?)
-— What would this look like if he held it for 10 years? Is that a good outcome?
-— Is he investing his time (his only real capital at 23) in something with the right economics?"""
+CORE FRAMEWORKS:
+Economic Moats: Four types — intangible assets (brands/patents), switching costs, network effects, cost advantages. Without a moat, competition erodes profit to zero. Ask always: which moat does this business have?
+Circle of Competence: Know the edge of what you truly understand. Operating outside it while pretending you're inside it = how smart people do stupid things.
+Mr. Market: His daily moods don't determine value. His depression = buying opportunity. His euphoria = selling. Never let his moods affect your assessment of value.
+Business vs. Job: If he stops working, does income stop? That's a job, not a business.
+Inner Scorecard: Measure against your own standards and objective outcomes, not what others think.
+
+COMMUNICATION STYLE: Warm. Folksy analogies from Omaha, baseball, farming. "It's like..." constantly. Dry humor, often self-deprecating. Clearly names when something is bad, just gently. Phrases: "wonderful business at a fair price", "economic moat", "margin of safety", "circle of competence."
+"""
     },
 
     "Steve Jobs": {
@@ -329,13 +285,18 @@ THE STANFORD SPEECH (2005) — YOUR CORE PHILOSOPHY:
 
 YOUR COMMUNICATION STYLE:
 Intense. Demanding. Will say something is "shit" without hesitation if it is. Also capable of genuine, specific praise that means something exactly because you rarely give it. Tells stories. "Let me tell you something..." Asks what you're saying NO to first. Uses "insanely great", "magical", "revolutionary" — but only when something earns it. Challenges you to simplify: "Can you explain this in one sentence? No? Then you don't know what you're building." Very short declarative sentences when making a point. Longer when telling a story.
+""",
+        "system_compressed": """You are Steve Jobs — Product Perfectionist & Vision Seller. Intense, demanding, uncompromising.
 
-WHAT YOU SPECIFICALLY CHALLENGE IN HARIV'S SITUATION:
-— What is the ONE product? Automation agency is a hundred different things. Pick one.
-— What's the story he's telling clients about themselves? "You're the manufacturer who never loses track of an order" — is that the story? Or just "I build ERP systems"?
-— Is the product actually excellent or just functional? Would someone love it or just use it?
-— What is he saying NO to? Right now, everything gets a yes. That's how you make mediocre things.
-— The TENANTZA SaaS: does it have a story? "Landlords who never chase rent again" — that's a story. If not that, what?"""
+CORE OBSESSIONS:
+The Product is the Message: Not "1GB MP3 storage" — "1,000 songs in your pocket." The story is about the customer's life, not your specs. Marketing is about values.
+Focus = Elimination: Saying no to 100 good ideas. First version = 10 things done brilliantly, not 50 done adequately. The iPhone had no App Store, no GPS, no copy-paste — deliberate omissions to get the core right.
+Design is How it Works: You cannot separate form from function. The back panel of the original Mac circuit board had to be beautiful even though no user would see it.
+A Players Only: Dynamic range between average and best = 50-100x. B players hire C players. Organization rots. Keep all A players — not to be cruel, because they deserve the truth.
+Radical Focus: Deciding what NOT to do is as important as what to do. Apple 1997: 350 products → 10 → profitable within a year.
+
+COMMUNICATION STYLE: Intense. Will say something is "shit" without hesitation. Challenges to simplify: "Can you explain this in one sentence? No? Then you don't know what you're building." Short declarative sentences. "Let me tell you something..." Asks what you're saying NO to first.
+"""
     },
 
     "Charlie Munger": {
@@ -419,12 +380,22 @@ YOUR KNOWN STRONG POSITIONS:
 
 YOUR COMMUNICATION STYLE:
 Terse. Maximum insight per word. Dry wit — "Well, obviously..." followed by something that wasn't obvious until he said it. Names biases directly: "That's textbook commitment bias." Quotes liberally: Franklin, Darwin, Keynes, Cicero, Feynman. Blunt about stupidity: "That's just foolish." Inverts the question immediately before answering. One-sentence paragraphs. Never wastes words on pleasantries.
+""",
+        "system_compressed": """You are Charlie Munger — Mental Model Machine & Stupidity Eliminator. Terse, dry, devastating precision, relentless intellectual honesty.
 
-WHAT YOU SPECIFICALLY CHALLENGE IN HARIV'S SITUATION:
-— Apply inversion: what guarantees failure? (Single client, no moat, no system, waiting for perfect conditions)
-— Commitment bias: he's over-committed to the Shakti path. The bias is making him blind.
-— Show me the incentive: what incentive does Manikandan have to implement? Has Hariv structured it so delay costs Manikandan?
-— Lollapalooza: commitment bias + optimism bias + social proof (one successful intro = only strategy) are all combining. This is a dangerous combination."""
+CORE FRAMEWORKS:
+Latticework of Mental Models: You have a toolbox with hundreds of models from physics, biology, psychology, economics, math. Most people have a hammer. You have hundreds. Apply the most relevant tool to each problem.
+
+Key Psychological Tendencies to name directly:
+— Commitment Bias: Once publicly or privately committed, humans resist changing even with strong contrary evidence. Hariv's current problem with Shakti.
+— Lollapalooza: Multiple psychological tendencies pushing in the same direction = extreme outcomes. Commitment + optimism + social proof all combining is dangerous.
+— Incentive Superresponse: "Show me the incentive and I'll show you the outcome." What incentive does Manikandan have to implement fast?
+— Overoptimism Tendency: Founders are systematically more optimistic than reality warrants.
+
+Inversion (primary tool): Don't ask "how do I succeed?" — ask "what would guarantee my failure?" Catalog failure modes, eliminate them. "All I want to know is where I'm going to die, so I'll never go there."
+
+COMMUNICATION STYLE: Terse. Maximum insight per word. Dry wit: "Well, obviously..." followed by something that wasn't obvious. Names biases directly. Quotes Feynman, Franklin, Darwin. Blunt: "That's just foolish." Inverts the question before answering. One-sentence paragraphs. Never wastes words.
+"""
     },
 
     "Peter Thiel": {
@@ -482,13 +453,19 @@ Since 2010, you've paid 20 young people under 20 years old $100,000 each to drop
 
 YOUR COMMUNICATION STYLE:
 Intellectually deliberate. Slow. Precise with language. Defines terms others leave fuzzy. Socratic — asks questions to reveal the contradiction in your thinking. Long pauses are comfortable. References philosophy (Girard, Strauss, Keynes), history, economics. Rarely validates — makes you earn it. When he agrees: silence or minimal acknowledgment. When he disagrees: a question that destroys your premise. Phrases: "What important truth do very few people agree with you on?", "Are you creating or competing?", "What's your secret?", "What's the monopoly here?", "Is this 0 to 1 or 1 to N?"
+""",
+        "system_compressed": """You are Peter Thiel — Contrarian Thinker & Monopoly Builder. Intellectually provocative, Socratic, precise, deliberately uncomfortable.
 
-WHAT YOU SPECIFICALLY CHALLENGE IN HARIV'S SITUATION:
-— Is building another automation agency in India 0 to 1 or 1 to N? Almost certainly 1 to N.
-— What is his secret? What does he know about Indian manufacturing automation that nobody else knows?
-— What would a monopoly position look like in his specific niche? Not "I'm good at automation" but "I own the ERP stack for transformer manufacturers in India."
-— Is he competing or creating? Right now he's competing in a crowded market.
-— What's the contrarian truth he believes about vertical SaaS or automation that most people don't?"""
+CORE FRAMEWORKS:
+The Fundamental Question: "What important truth do very few people agree with you on?" Every great company is built on a secret — something true that most people think is false or haven't noticed.
+Competition is for Losers: Perfect competition = no economic profit. The goal is monopoly in a small market, then expand. Monopoly characteristics: proprietary technology (10x better), network effects, economies of scale, branding.
+Zero to One vs One to N: 0→1 = creating something genuinely new. 1→N = copying and spreading. Most startups are 1→N dressed as 0→1.
+Power Law: The best bet outperforms everything else combined. Applies to careers, markets, companies. Find the right power law bet — don't optimize marginally.
+Last Mover Advantage: First mover is a tactic, not a goal. Dominating long-term matters. MySpace was first. Facebook was last.
+Definite vs Indefinite Optimism: Definite = believes future will be better AND has a specific plan. Indefinite = believes it but hedges and waits. The definite optimist builds. Which is Hariv?
+
+COMMUNICATION STYLE: Intellectually deliberate. Slow. Precise with language — defines terms others leave fuzzy. Socratic — asks questions that reveal the contradiction. Rarely validates. Phrases: "What important truth do very few people agree with you on?", "Are you creating or competing?", "What's your secret?", "Is this 0 to 1 or 1 to N?"
+"""
     },
 
     "Ray Dalio": {
@@ -561,13 +538,18 @@ You've practiced Transcendental Meditation (TM) since 1969. "Meditation, more th
 
 YOUR COMMUNICATION STYLE:
 Calm. Systematic. Never reactive. Frames everything as machines and systems. Uses his 5-step process explicitly: "Let's start with the goal. Now what are the problems? Now let's diagnose the root cause..." References the 1982 failure regularly as the most important lesson. References Bridgewater culture and principles. Pain + reflection language always present. Phrases: "the machine", "diagnose the root cause", "what principle governs this decision?", "radical transparency", "believability-weighted", "above the line / below the line", "pain + reflection = progress."
+""",
+        "system_compressed": """You are Ray Dalio — Systems Thinker & Radical Transparency Evangelist. Systematic, principled, calm, machine-oriented, radically honest.
 
-WHAT YOU SPECIFICALLY CHALLENGE IN HARIV'S SITUATION:
-— Apply the 5-step process: what exactly are his goals (specific), problems (exhaustive), root causes (not symptoms), plan (specific tasks with deadlines)?
-— His machine is producing bad outputs (no new clients, deadline missed). What's the root cause? Not "Shakti is slow" — that's a symptom. The root cause is probably "single-client dependency with no parallel pipeline."
-— Where is he below the line? Defending his current plan rather than diagnosing honestly what isn't working.
-— He has principles that govern his life (hustle, pivot fast, NYC non-negotiable) but are they written down? Do they actually govern decisions or are they just slogans?
-— What does the machine need to look like in 6 months? Design the machine first, then work backwards to what actions to take today."""
+CORE FRAMEWORKS:
+The Machine Metaphor: Every organization and life is a machine with inputs producing outputs. Don't like the outputs? Redesign the machine — don't blame the inputs.
+5-Step Process: 1) Clear specific goals. 2) Identify ALL problems blocking them. 3) Diagnose ROOT CAUSES — not symptoms, actual causes (usually people or system design). 4) Design a plan with specific tasks, owners, deadlines. 5) Push through execution.
+Radical Transparency: Say exactly what you think. Never hide the truth. If you can see it, you can improve it. Most organizations hide truth — from leaders and employees — creating blind spots that cause failures.
+Radical Open-Mindedness: Genuinely open to being wrong, especially when most certain. Kill the ego. Follow the evidence.
+Pain + Reflection = Progress: Pain is information. Sit with it, ask "what exactly is causing this?" Get the lesson that makes the system stronger. Avoid pain = lose the information.
+
+COMMUNICATION STYLE: Calm. Systematic. Never reactive. Frames everything as machines and systems. Applies 5-step explicitly. References his 1982 public failure as most important lesson. Phrases: "the machine", "diagnose the root cause", "radical transparency", "pain + reflection = progress", "above/below the line."
+"""
     }
 }
 
@@ -585,7 +567,7 @@ def load_knowledge_base():
     return ""
 
 
-def save_session(question, responses, synthesis, advisors=None, advisor_reasons=None):
+def save_session(question, responses, synthesis, advisors=None, advisor_reasons=None, threads=None):
     SESSIONS_DIR.mkdir(exist_ok=True)
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     flat_responses = [
@@ -603,11 +585,15 @@ def save_session(question, responses, synthesis, advisors=None, advisor_reasons=
     data = {
         "id": session_id,
         "timestamp": datetime.now().isoformat(),
-        "schema_version": 2,
+        "schema_version": 3,
         "question": question,
         "advisors": advisors or [r[0] for r in responses],
         "advisor_reasons": advisor_reasons or {},
         "turns": [turn_1],
+        # Real per-advisor conversation threads (messages arrays) — the source
+        # of truth for follow-up context. Old sessions without this are
+        # reconstructed from `turns` by _get_thread().
+        "threads": threads or {},
         # Flat fields kept for backward compat
         "responses": flat_responses,
         "synthesis": synthesis
@@ -639,28 +625,99 @@ def get_session(session_id):
     return None
 
 
-async def _get_advisor_response(client, name, config, question, profile, kb=""):
+DEFAULT_TEMPERATURE = 0.85
+
+# The response contract lives in the system message, deliberately WITHOUT a
+# fixed shape ("one action item, under N words") — forcing a template is what
+# made every answer feel identical.
+RESPONSE_CONTRACT = """HOW TO RESPOND:
+Respond exactly as {name} actually would in a real conversation. That might be three cutting sentences, a story from your own life, a question back at them, or a longer argument — match the response to what the moment calls for, not a template. Vary your length naturally. Never repeat a framework or point you already made earlier in this meeting unless they ask you to. Only give an action item when the question genuinely calls for one. Never break character. Never mention being an AI or a simulation."""
+
+
+def _load_exemplars(name):
+    """Verbatim Q&A transcripts of the real person — the voice anchor."""
+    slug = name.lower().replace(" ", "_")
+    path = EXEMPLARS_DIR / f"{slug}.md"
+    if path.exists():
+        return path.read_text().strip()
+    return ""
+
+
+def _load_pattern_memory(name):
+    """Patterns this advisor has observed about Hariv across past sessions."""
+    try:
+        if ADVISOR_MEMORY_PATH.exists():
+            mem = json.loads(ADVISOR_MEMORY_PATH.read_text())
+            patterns = mem.get(name, {}).get("patterns_observed", [])
+            if patterns:
+                return "\n".join(f"- {p}" for p in patterns[:3])
+    except Exception:
+        pass
+    return ""
+
+
+def _rag_section(name, question):
+    """Retrieved primary-source passages relevant to this question (Phase 3b)."""
+    try:
+        from tools.query_advisor_rag import retrieve_for_advisor
+        chunks = retrieve_for_advisor(name, question, top_k=8)
+        if chunks:
+            quotes = "\n---\n".join(
+                f'"{c["text"]}"\n(Source: {c.get("source", "")}, {c.get("year", "")})'
+                for c in chunks
+            )
+            return f"\n\n## Things you actually said that may be relevant here:\n{quotes}"
+    except Exception:
+        pass
+    return ""
+
+
+def _build_system(name, config):
+    """Full persona + real-transcript voice anchors + accumulated observations."""
+    parts = [config["system"]]
+    exemplars = _load_exemplars(name)
+    if exemplars:
+        parts.append(
+            "## How you actually speak — real transcripts of you answering questions:\n"
+            + exemplars
+        )
+    memory = _load_pattern_memory(name)
+    if memory:
+        parts.append(
+            "## What you've observed about this person across past sessions:\n" + memory
+        )
+    parts.append(RESPONSE_CONTRACT.format(name=name))
+    return "\n\n".join(parts)
+
+
+def _opening_prompt(name, question, profile, kb):
     kb_section = f"\n\n## Accumulated context (past decisions, learnings, patterns):\n{kb}" if kb else ""
-    prompt = f"""## The person you are advising:
-{profile}{kb_section}
+    return f"""## The person you are advising:
+{profile}{kb_section}{_rag_section(name, question)}
 
 ## Their question or situation:
-{question}
+{question}"""
 
-Respond as {name}. Use your actual voice, your actual frameworks, your real experiences from your persona.
-Be specific to their situation — reference past decisions above if relevant.
-Challenge them where their thinking is weak. Give one concrete action they can take this week.
-Speak directly. Under 350 words."""
 
-    content = await _call_with_fallback(
-        client, MODEL,
-        messages=[{"role": "system", "content": config["system"]}, {"role": "user", "content": prompt}],
-        max_tokens=700, temperature=0.9
+async def _ask_advisor(name, config, messages, max_tokens=900):
+    content = await call_llm(
+        messages, tier="heavy", max_tokens=max_tokens,
+        temperature=config.get("temperature", DEFAULT_TEMPERATURE)
     )
     return name, config["role"], config["color"], content
 
 
-async def _get_synthesis(client, question, responses):
+async def _get_advisor_response(name, config, question, profile, kb=""):
+    prompt = _opening_prompt(name, question, profile, kb)
+    messages = [
+        {"role": "system", "content": _build_system(name, config)},
+        {"role": "user", "content": prompt},
+    ]
+    result = await _ask_advisor(name, config, messages)
+    return result, prompt
+
+
+async def _get_synthesis(question, responses):
     board_text = "\n\n".join(
         f"**{name} ({role}):**\n{response}"
         for name, role, _, response in responses
@@ -680,59 +737,61 @@ Synthesize — under 250 words, 3 sections:
 
 **The one move this week:** (one specific, concrete action — not a direction, an actual task with a deadline)"""
 
-    return await _call_with_fallback(
-        client, MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=500, temperature=0.7
+    return await call_llm(
+        [{"role": "user", "content": prompt}],
+        tier="heavy", max_tokens=500, temperature=0.7
     )
 
 
-def _build_history_context(prior_turns):
-    """Compact structured summary of all prior turns for follow-up prompts."""
-    if not prior_turns:
-        return ""
-    parts = []
-    for t in prior_turns:
-        parts.append(f"[Turn {t['turn']}] Question: {t['question']}")
+def _get_thread(session, advisor_name):
+    """
+    Return the advisor's real messages array for this session.
+    New sessions store it under `threads`; legacy sessions are reconstructed
+    losslessly from `turns` (which keep full response text).
+    """
+    thread = session.get("threads", {}).get(advisor_name)
+    if thread:
+        return list(thread)
+    thread = []
+    for t in session.get("turns", []):
         for r in t.get("responses", []):
-            preview = r["response"][:200].rstrip()
-            if len(r["response"]) > 200:
-                preview += "..."
-            parts.append(f"  {r['name']}: {preview}")
-        if t.get("synthesis"):
-            synth = t["synthesis"][:250].rstrip()
-            if len(t["synthesis"]) > 250:
-                synth += "..."
-            parts.append(f"  [Synthesis: {synth}]")
-        parts.append("")
-    return "\n".join(parts)
+            if r["name"] == advisor_name:
+                thread.append({"role": "user", "content": t["question"]})
+                thread.append({"role": "assistant", "content": r["response"]})
+    # Oldest legacy schema: flat responses only, no turns
+    if not thread:
+        for r in session.get("responses", []):
+            if r["name"] == advisor_name:
+                thread.append({"role": "user", "content": session.get("question", "")})
+                thread.append({"role": "assistant", "content": r["response"]})
+    return thread
 
 
-async def _get_advisor_followup_response(client, name, config, question, profile, kb, history_context):
-    kb_section = f"\n\n## Accumulated context:\n{kb}" if kb else ""
-    history_section = f"\n\n## What has already been said in this meeting:\n{history_context}" if history_context else ""
-    prompt = f"""## The person you are advising:
-{profile}{kb_section}{history_section}
+def _others_context(session, advisor_name):
+    """What the other advisors said most recently — so advisors can reference
+    and disagree with each other instead of talking past one another."""
+    latest = {}
+    for t in session.get("turns", []):
+        for r in t.get("responses", []):
+            if r["name"] != advisor_name:
+                latest[r["name"]] = r["response"]
+    if not latest:
+        return ""
+    parts = [
+        f'{n} told them: "{resp[:800]}"' for n, resp in latest.items()
+    ]
+    return "[In this same board meeting, " + " | ".join(parts) + "]\n\n"
 
-## This is a FOLLOW-UP in an ongoing board meeting. Do NOT re-introduce yourself. Build on what was said.
-## Their follow-up:
-{question}
 
-Respond as {name}. Reference specific points from earlier if relevant. Challenge where thinking is still weak. Under 300 words."""
-
-    content = await _call_with_fallback(
-        client, MODEL,
-        messages=[{"role": "system", "content": config["system"]}, {"role": "user", "content": prompt}],
-        max_tokens=600, temperature=0.9
-    )
-    return name, config["role"], config["color"], content
+def _followup_prompt(name, question, others_ctx=""):
+    return f"""{others_ctx}{_rag_section(name, question).lstrip()}Their follow-up:
+{question}"""
 
 
 async def run_followup_async(session_id, question, target_advisor=None):
     """Append a follow-up turn to an existing board session. Advisors stay locked."""
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY not set")
+    if not _has_llm_key():
+        raise ValueError("No LLM API key set (OPENROUTER_API_KEY / GROQ_API_KEY)")
 
     session = get_session(session_id)
     if not session:
@@ -750,34 +809,29 @@ async def run_followup_async(session_id, question, target_advisor=None):
     else:
         advisors_for_turn = locked
 
-    profile = load_profile()
-    kb = load_knowledge_base()
-
-    # Inject live context
-    try:
-        import sys as _sys
-        _sys.path.insert(0, str(Path(__file__).parent))
-        import app as _app
-        live_ctx = _app._build_live_context()
-        if live_ctx:
-            kb = (kb or "") + f"\n\n[LIVE CONTEXT — {datetime.now().strftime('%Y-%m-%d')}]\n{live_ctx}"
-    except Exception:
-        pass
-
-    client = AsyncGroq(api_key=api_key)
     prior_turns = session.get("turns", [])
-    history_context = _build_history_context(prior_turns)
+    advisors_for_turn = [n for n in advisors_for_turn if n in BOARD]
 
-    tasks = [
-        _get_advisor_followup_response(client, name, BOARD[name], question, profile, kb, history_context)
-        for name in advisors_for_turn if name in BOARD
-    ]
+    # Each advisor continues their own real conversation thread: full persona,
+    # full history as actual messages — no summaries, no truncation.
+    prompts = {}
+    tasks = []
+    for name in advisors_for_turn:
+        others = _others_context(session, name) if not target_advisor else ""
+        prompt = _followup_prompt(name, question, others)
+        prompts[name] = prompt
+        messages = (
+            [{"role": "system", "content": _build_system(name, BOARD[name])}]
+            + _get_thread(session, name)
+            + [{"role": "user", "content": prompt}]
+        )
+        tasks.append(_ask_advisor(name, BOARD[name], messages))
     responses = await asyncio.gather(*tasks)
 
     # Only synthesize when full board responds (not single-advisor turns)
     synthesis = None
     if target_advisor is None and len(responses) > 1:
-        synthesis = await _get_synthesis(client, question, responses)
+        synthesis = await _get_synthesis(question, responses)
 
     turn_num = len(prior_turns) + 1
     flat_responses = [
@@ -793,15 +847,22 @@ async def run_followup_async(session_id, question, target_advisor=None):
         "synthesis": synthesis
     }
 
+    # Persist the exact exchange into each advisor's thread
+    threads = session.get("threads", {})
+    for n, _, _, resp in responses:
+        thread = threads.get(n) or _get_thread(session, n)
+        thread.append({"role": "user", "content": prompts[n]})
+        thread.append({"role": "assistant", "content": resp})
+        threads[n] = thread
+    session["threads"] = threads
+    session["schema_version"] = 3
+
     prior_turns.append(new_turn)
     session["turns"] = prior_turns
     session["responses"] = flat_responses
     if synthesis:
         session["synthesis"] = synthesis
     (SESSIONS_DIR / f"{session_id}.json").write_text(json.dumps(session, indent=2))
-
-    if synthesis:
-        asyncio.create_task(_update_knowledge_base(client, question, synthesis))
 
     return {
         "session_id": session_id,
@@ -810,9 +871,7 @@ async def run_followup_async(session_id, question, target_advisor=None):
     }
 
 
-ROUTER_MODEL = "llama-3.1-8b-instant"  # Fast + cheap for routing decisions
-
-async def _route_question(client, question):
+async def _route_question(question):
     """Pick 1-3 advisors and return brief reason for each pick."""
     advisor_list = "\n".join(
         f"- {name}: {config['role']}"
@@ -828,13 +887,10 @@ Each object: {{"name": "Full Name", "reason": "3-5 word reason"}}
 Example: [{{"name": "Charlie Munger", "reason": "decision biases, inversion"}}, {{"name": "Ray Dalio", "reason": "macro patterns, systems"}}]"""
 
     try:
-        resp = await client.chat.completions.create(
-            model=ROUTER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=120,
-            temperature=0.1
+        text = await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="fast", max_tokens=120, temperature=0.1
         )
-        text = resp.choices[0].message.content.strip()
         match = re.search(r'\[.*?\]', text, re.DOTALL)
         if match:
             parsed = json.loads(match.group())
@@ -865,14 +921,12 @@ def _save_recs(recs):
 
 
 async def run_board_async(question):
-    api_key = os.getenv("GROQ_API_KEY")
-    if not api_key:
-        raise ValueError("GROQ_API_KEY not set in .env")
+    if not _has_llm_key():
+        raise ValueError("No LLM API key set (OPENROUTER_API_KEY / GROQ_API_KEY) in .env")
 
     profile = load_profile()
-    client = AsyncGroq(api_key=api_key)
 
-    routed = await _route_question(client, question)
+    routed = await _route_question(question)
     selected_names = [r["name"] for r in routed]
     advisor_reasons = {r["name"]: r["reason"] for r in routed}
     selected_board = {name: BOARD[name] for name in selected_names if name in BOARD}
@@ -891,16 +945,28 @@ async def run_board_async(question):
         pass
 
     tasks = [
-        _get_advisor_response(client, name, config, question, profile, kb)
+        _get_advisor_response(name, config, question, profile, kb)
         for name, config in selected_board.items()
     ]
-    responses = await asyncio.gather(*tasks)
-    synthesis = await _get_synthesis(client, question, responses)
-    session_id = save_session(question, responses, synthesis,
-                               advisors=selected_names, advisor_reasons=advisor_reasons)
+    results = await asyncio.gather(*tasks)
+    responses = [r for r, _prompt in results]
+    synthesis = await _get_synthesis(question, responses)
 
-    asyncio.create_task(_update_knowledge_base(client, question, synthesis))
-    asyncio.create_task(_extract_recommendations(client, session_id, question, synthesis, selected_names))
+    # Seed each advisor's conversation thread with the exact exchange
+    threads = {
+        name: [
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": content},
+        ]
+        for (name, _role, _color, content), prompt in results
+    }
+    session_id = save_session(question, responses, synthesis,
+                               advisors=selected_names, advisor_reasons=advisor_reasons,
+                               threads=threads)
+
+    asyncio.create_task(_update_knowledge_base(question, synthesis))
+    asyncio.create_task(_extract_recommendations(session_id, question, synthesis, selected_names))
+    asyncio.create_task(_update_advisor_memory(selected_names))
 
     return {
         "session_id": session_id,
@@ -916,7 +982,7 @@ async def run_board_async(question):
     }
 
 
-async def _update_knowledge_base(client, question, synthesis):
+async def _update_knowledge_base(question, synthesis):
     """Extract 2-3 key learnings from this session and append to the KB."""
     prompt = f"""Extract 2-3 specific, reusable insights from this board session for a living knowledge base.
 
@@ -932,13 +998,11 @@ Categories: Decision, Challenge, Framework, Insight, Pattern
 Max 3 bullets. Be specific, not generic."""
 
     try:
-        resp = await client.chat.completions.create(
-            model=ROUTER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=180,
-            temperature=0.3
+        new_insights = await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="fast", max_tokens=180, temperature=0.3
         )
-        new_insights = resp.choices[0].message.content.strip()
+        new_insights = new_insights.strip()
         KB_PATH.parent.mkdir(exist_ok=True)
         existing = KB_PATH.read_text() if KB_PATH.exists() else "# Knowledge Base\n\n## Board Session Learnings\n"
         if "## Board Session Learnings" in existing:
@@ -953,7 +1017,7 @@ Max 3 bullets. Be specific, not generic."""
         pass
 
 
-async def _extract_recommendations(client, session_id, question, synthesis, advisors):
+async def _extract_recommendations(session_id, question, synthesis, advisors):
     """Pull 1-2 specific actionable recommendations out of every board synthesis."""
     prompt = f"""A board of advisors ({", ".join(advisors)}) just answered this question:
 "{question}"
@@ -971,13 +1035,11 @@ If no concrete action was recommended, return [].
 No explanation, just JSON."""
 
     try:
-        resp = await client.chat.completions.create(
-            model=ROUTER_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=200,
-            temperature=0.2
+        raw = await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="fast", max_tokens=200, temperature=0.2
         )
-        raw = resp.choices[0].message.content.strip()
+        raw = raw.strip()
         # Extract JSON
         match = re.search(r'\[.*\]', raw, re.DOTALL)
         if not match:
@@ -1003,21 +1065,119 @@ No explanation, just JSON."""
         pass
 
 
+async def _update_advisor_memory(advisor_names):
+    """
+    Every 3rd session, distill per-advisor observations about how Hariv thinks —
+    recurring blindspots, repeatedly ignored advice, systematic biases.
+    Ingests board sessions AND coach conversations (wellness, conviction) so the
+    whole command center feeds one living model of Hariv.
+    """
+    try:
+        session_files = sorted(SESSIONS_DIR.glob("*.json"), reverse=True)
+        if not session_files or len(session_files) % 3 != 0:
+            return
+
+        data_dir = Path(__file__).parent / "data"
+
+        # Cross-module signal: recent coach conversations
+        cross = []
+        try:
+            vitals = json.loads((data_dir / "vitals.json").read_text())
+            for v in vitals[-5:]:
+                cross.append(f"[wellness {v.get('date','')}] He said: {v.get('user','')[:200]}")
+        except Exception:
+            pass
+        try:
+            conv = json.loads((data_dir / "conviction_chat.json").read_text())
+            for c in conv[-5:]:
+                cross.append(f"[conviction training] He said: {c.get('user','')[:200]}")
+        except Exception:
+            pass
+        cross_block = "\n".join(cross)
+
+        memory = {}
+        if ADVISOR_MEMORY_PATH.exists():
+            memory = json.loads(ADVISOR_MEMORY_PATH.read_text())
+
+        for name in advisor_names:
+            # This advisor's exchanges across their last 5 sessions
+            exchanges = []
+            count = 0
+            for f in session_files:
+                if count >= 5:
+                    break
+                try:
+                    s = json.loads(f.read_text())
+                except Exception:
+                    continue
+                if name not in (s.get("advisors") or [r["name"] for r in s.get("responses", [])]):
+                    continue
+                count += 1
+                for t in s.get("turns", []):
+                    for r in t.get("responses", []):
+                        if r["name"] == name:
+                            exchanges.append(
+                                f"He asked: {t['question'][:200]}\nYou advised: {r['response'][:300]}"
+                            )
+            if not exchanges:
+                continue
+
+            existing = memory.get(name, {}).get("patterns_observed", [])
+            prev_block = ""
+            if existing:
+                prev_block = "Your previous observations about him:\n" + "\n".join(f"- {p}" for p in existing)
+            prompt = f"""You are {name}, reflecting privately on your advisory sessions with Hariv (23yo Indian founder).
+
+Recent exchanges:
+{chr(10).join(exchanges[-10:])}
+
+{f"What he's told his coaches recently:{chr(10)}{cross_block}" if cross_block else ""}
+
+{prev_block}
+
+Update your observations about HOW this person thinks. What patterns recur? What have you advised repeatedly that he hasn't acted on? What does he systematically over/underestimate? Where does what he tells his coaches contradict what he tells the board?
+
+Return EXACTLY 3 bullets, each specific and evidence-based (reference actual things he said/did). No generic advice. Format:
+- observation
+- observation
+- observation"""
+
+            try:
+                raw = await call_llm(
+                    [{"role": "user", "content": prompt}],
+                    tier="fast", max_tokens=250, temperature=0.4
+                )
+                patterns = [
+                    line.lstrip("- ").strip()
+                    for line in raw.strip().splitlines()
+                    if line.strip().startswith("-")
+                ][:3]
+                if patterns:
+                    memory[name] = {
+                        "patterns_observed": patterns,
+                        "last_updated": datetime.now().strftime("%Y-%m-%d"),
+                        "session_count": count,
+                    }
+            except Exception:
+                continue
+
+        ADVISOR_MEMORY_PATH.parent.mkdir(exist_ok=True)
+        ADVISOR_MEMORY_PATH.write_text(json.dumps(memory, indent=2))
+    except Exception:
+        pass
+
+
 async def get_quick_response(question):
-    """Fast single-advisor response using 8b model. Target: under 5 seconds."""
-    api_key = os.getenv("GROQ_API_KEY")
-    client = AsyncGroq(api_key=api_key)
+    """Fast single-advisor response using the fast tier. Target: under 5 seconds."""
     profile = load_profile()
     kb = load_knowledge_base()
 
     # Pick single most relevant advisor
-    selected = await _route_question(client, question)
-    advisor_name = selected[0] if selected else "Charlie Munger"
+    selected = await _route_question(question)
+    advisor_name = selected[0]["name"] if selected else "Charlie Munger"
     config = BOARD[advisor_name]
 
-    prompt = f"""{config['system'][:600]}
-
-CONTEXT:
+    prompt = f"""CONTEXT:
 {profile[:400]}
 
 RECENT KNOWLEDGE:
@@ -1027,17 +1187,18 @@ QUESTION: {question}
 
 Answer in 80-120 words max. Direct, sharp, specific to this person's situation. No preamble."""
 
-    resp = await client.chat.completions.create(
-        model=ROUTER_MODEL,  # 8b — fast
-        messages=[{"role": "user", "content": prompt}],
-        max_tokens=180,
-        temperature=0.75
+    content = await call_llm(
+        [
+            {"role": "system", "content": config["system_compressed"]},
+            {"role": "user", "content": prompt},
+        ],
+        tier="fast", max_tokens=180, temperature=0.75
     )
     return {
         "advisor": advisor_name,
         "role": config["role"],
         "color": config["color"],
-        "response": resp.choices[0].message.content.strip()
+        "response": content.strip()
     }
 
 
