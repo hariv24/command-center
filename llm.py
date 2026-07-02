@@ -86,12 +86,23 @@ def _together_client():
         return None
 
 
-async def _try(client, model, messages, max_tokens, temperature):
-    r = await client.chat.completions.create(
-        model=model, messages=messages,
-        max_tokens=max_tokens, temperature=temperature,
-    )
+import re as _re
+
+_THINK_RE = _re.compile(r"<think>.*?</think>\s*", _re.DOTALL)
+
+
+async def _try(client, model, messages, max_tokens, temperature, openrouter=False):
+    kwargs = dict(model=model, messages=messages,
+                  max_tokens=max_tokens, temperature=temperature,
+                  timeout=60)  # a stalled provider must fall through, not hang the board
+    if openrouter:
+        # Reasoning models (Nemotron, gpt-oss) otherwise leak their hidden
+        # thinking into content or burn the whole token budget on it.
+        kwargs["extra_body"] = {"reasoning": {"exclude": True}}
+    r = await client.chat.completions.create(**kwargs)
     text = r.choices[0].message.content
+    if text:
+        text = _THINK_RE.sub("", text)
     if not text or not text.strip():
         raise RuntimeError(f"empty response from {model}")
     return text
@@ -112,7 +123,7 @@ async def call_llm(messages, tier="heavy", max_tokens=900, temperature=0.85):
         candidates = [MODELS["openrouter"][tier]] + MODELS["openrouter"].get(f"{tier}_backups", [])
         for model in candidates:
             try:
-                return await _try(client, model, messages, max_tokens, temperature)
+                return await _try(client, model, messages, max_tokens, temperature, openrouter=True)
             except Exception:
                 continue  # any failure -> next free model, then next provider
         return None
