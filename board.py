@@ -635,7 +635,8 @@ DEFAULT_TEMPERATURE = 0.85
 # fixed shape ("one action item, under N words") — forcing a template is what
 # made every answer feel identical.
 RESPONSE_CONTRACT = """HOW TO RESPOND:
-Respond exactly as {name} actually would in a real conversation. That might be three cutting sentences, a story from your own life, a question back at them, or a longer argument — match the response to what the moment calls for, not a template. Vary your length naturally. Never repeat a framework or point you already made earlier in this meeting unless they ask you to. Only give an action item when the question genuinely calls for one. Never break character. Never mention being an AI or a simulation."""
+Respond exactly as {name} actually would in a real conversation. That might be three cutting sentences, a story from your own life, a question back at them, or a longer argument — match the response to what the moment calls for, not a template. Vary your length naturally. Never repeat a framework or point you already made earlier in this meeting unless they ask you to. Only give an action item when the question genuinely calls for one. Never break character. Never mention being an AI or a simulation.
+Start straight in on your actual answer. Never open by describing the question back ("You're asking me to react to...", "The user wants me to...", "I'll respond to what the others said by...") — that's narrating the task instead of doing it, and it never happens in a real conversation."""
 
 
 def _load_exemplars(name):

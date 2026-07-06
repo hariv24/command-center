@@ -188,6 +188,13 @@ select option{background:var(--s2)}
 .aname{font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;margin-bottom:2px}
 .arole{font-size:10px;color:var(--t3)}
 .atxt{font-size:13px;line-height:1.75;color:var(--t2);white-space:pre-wrap}
+.atxt.rendered{white-space:normal}
+.atxt.rendered h1,.atxt.rendered h2,.atxt.rendered h3{font-size:12px;color:var(--t1);margin:10px 0 4px;font-weight:700;text-transform:uppercase;letter-spacing:1.5px}
+.atxt.rendered strong{color:var(--t1)}
+.atxt.rendered p{margin-bottom:7px}
+.atxt.rendered p:last-child{margin-bottom:0}
+.atxt.rendered ul,.atxt.rendered ol{padding-left:13px;margin-bottom:7px}
+.atxt.rendered li{margin-bottom:3px}
 .bd-turn{margin-top:24px}.bd-turn-divider{display:flex;align-items:center;gap:10px;margin-bottom:14px}.bd-turn-line{flex:1;height:1px;background:var(--h2)}.bd-turn-label{font-family:var(--fm);font-size:8px;font-weight:700;letter-spacing:2.5px;color:var(--t3);text-transform:uppercase;white-space:nowrap}
 .synth{background:var(--s2);border:1px solid var(--h1);padding:20px}
 .synth-body{font-size:13.5px;line-height:1.85;color:var(--t2)}
@@ -1185,7 +1192,7 @@ function _advisorCards(responses){
   return responses.map(r=>`
     <div class="acard" data-advisor="${esc(r.name)}" style="border-left-color:${r.color}">
       <div class="acard-head">${advPhoto(r.name)}<div><div class="aname" style="color:${r.color}">${r.name}</div><div class="arole">${r.role}</div></div></div>
-      <div class="atxt" data-role="text">${esc(r.response)}</div>
+      <div class="atxt rendered" data-role="text">${marked.parse(r.response||'')}</div>
     </div>`).join('');
 }
 
@@ -1211,6 +1218,11 @@ function _driveStream(url,body,{gridEl,routeEl,onRouting}){
         if(cardWrap){
           cardWrap.classList.remove('streaming');
           if(evt.content&&evt.content.startsWith('error:'))cardWrap.classList.add('err');
+          // Streaming filled this in as raw text (token-by-token markdown can't be
+          // parsed incrementally) — swap to the rendered version now that it's final,
+          // so **bold**/## headers don't sit there as literal asterisks and hashes.
+          const textEl=cardWrap.querySelector('[data-role="text"]');
+          if(textEl&&evt.content){textEl.innerHTML=marked.parse(evt.content);textEl.classList.add('rendered');}
         }
       }else if(evt.event==='synthesis_token'){
         collected.synthesis+=evt.delta;
@@ -1279,10 +1291,10 @@ async function runBoard(){
 // monologues. Reuses the followup-stream endpoint with a canned prompt and a
 // tighter token cap (real disagreement fits in a few sentences).
 async function runDebateRound(){
-  const debateQ="React to what the other advisors just said above. State explicitly where you agree and where you'd push back — call them out by name if you disagree. Under 150 words, no preamble.";
+  const debateQ="What do you think of what the others just said? Push back by name if you disagree, or say plainly where you agree. Answer directly — don't restate this question or describe what you're about to do. Under 150 words.";
   const {gridEl,synthSlot}=_liveTurnShell(boardConversation.length+1,'[Board deliberation round]',null);
   try{
-    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:debateQ,max_tokens:280},{gridEl});
+    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:debateQ,max_tokens:600},{gridEl});
     const responses=collected.advisors.map(name=>{
       const r=collected.responses[name]||{};
       const info=AC[name]||{};
@@ -1323,9 +1335,9 @@ async function runDebate(){
       <div class="acard" style="border-left-color:${d.color}">
         <div class="acard-head">${advPhoto(d.name)}<div><div class="aname" style="color:${d.color}">${esc(d.name)}</div><div class="arole">${esc(d.role||'')}</div></div></div>
         <div style="font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:4px">Opening</div>
-        <div class="atxt" data-role="text">${esc(d.opening)}</div>
+        <div class="atxt rendered" data-role="text">${marked.parse(d.opening||'')}</div>
         <div style="font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin:10px 0 4px">Rebuttal</div>
-        <div class="atxt" data-role="text">${esc(d.rebuttal)}</div>
+        <div class="atxt rendered" data-role="text">${marked.parse(d.rebuttal||'')}</div>
       </div>`).join('');
     document.getElementById('bdsynth').innerHTML=
       `<div style="font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:6px">Judge: ${esc(dbt.judge.name)}</div>`+
