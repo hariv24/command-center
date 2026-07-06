@@ -2,13 +2,18 @@
 Runtime retrieval from advisor knowledge bases. Imported by board.py.
 Fails soft: if chromadb / the DB / the collection is missing, returns [].
 
-Requires on the VM:  pip install chromadb sentence-transformers
+Requires on the server:  pip install chromadb fastembed
 and a chroma_db/ directory synced from the MacBook (see build_advisor_rag.py).
+
+Uses fastembed (ONNX runtime) instead of sentence-transformers/PyTorch — a ~100MB
+dependency instead of ~1.5GB, safe on small VMs. Must match the model used to build
+the DB (see EMBED_MODEL in build_advisor_rag.py) or retrieval quality breaks silently.
 """
 
 from pathlib import Path
 
 DB_DIR = Path(__file__).parent.parent / "chroma_db"
+EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 
 NAME_TO_SLUG = {
     "Elon Musk": "elon_musk", "Jeff Bezos": "jeff_bezos",
@@ -32,8 +37,8 @@ def _get_client():
 def _get_model():
     global _model
     if _model is None:
-        from sentence_transformers import SentenceTransformer
-        _model = SentenceTransformer("all-mpnet-base-v2")
+        from fastembed import TextEmbedding
+        _model = TextEmbedding(model_name=EMBED_MODEL)
     return _model
 
 
@@ -46,7 +51,7 @@ def retrieve_for_advisor(advisor_name, question, top_k=8):
         coll = _get_client().get_collection(f"advisor_{slug}")
         if not coll.count():
             return []
-        embedding = _get_model().encode([question])[0].tolist()
+        embedding = list(_get_model().embed([question]))[0].tolist()
         res = coll.query(query_embeddings=[embedding], n_results=min(top_k, coll.count()))
         out = []
         for doc, meta in zip(res["documents"][0], res["metadatas"][0]):

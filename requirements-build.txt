@@ -1,0 +1,5 @@
+# Mac-only build tooling — NOT installed on servers.
+# Used once by tools/collect_advisor_sources.py / ingest_content_folder.py to
+# extract source PDFs into plain text. Server never touches raw PDFs, only the
+# already-built chroma_db/ that gets rsynced over.
+pypdf==6.14.2

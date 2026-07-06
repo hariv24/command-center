@@ -19,6 +19,7 @@ Get multi-perspective advice from 7 GOAT-level billionaire personas on any quest
 - Profile loaded at `agent/profile.md` (already set up)
 
 ## How to Run
+Primary interface is the dashboard (`python app.py` → Board tab, streamed responses) or Telegram (`/board <question>`). For a quick CLI-only session (no streaming, no session persistence beyond the usual `sessions/*.json`):
 ```bash
 cd /Users/harivkannan/Desktop/DOLLA/agent
 python tools/board_session.py "Your question here"
@@ -47,7 +48,11 @@ python tools/board_session.py "Your question here"
 - For emotional/personal decisions, use a different tool (this board is business-only)
 
 ## Setup (First Time)
-```bash
-pip install anthropic python-dotenv
-# Add your ANTHROPIC_API_KEY to agent/.env
-```
+Uses the same provider chain as the rest of the app (OpenRouter → Groq → Together — see `llm.py`), not Anthropic directly. Add `OPENROUTER_API_KEY` (and/or `GROQ_API_KEY`, `TOGETHER_API_KEY`) to `agent/.env`.
+
+## Grounding
+Each advisor's response is additionally grounded in two RAG sources (fail soft to nothing if the index is missing):
+- `chroma_db/` — the advisor's own words (letters, transcripts, books) via `tools/query_advisor_rag.py`
+- `personal_rag_db/` — Hariv's own history (past sessions, logs, decisions) via `build_personal_rag.py`, built incrementally after every session
+
+Every session is also anchored to a deterministic state block (`_anchor_header` in `app.py`) — MRR gap, NYC countdown, broken commitments — so advice starts from the real scoreboard, not just the mood of the question.

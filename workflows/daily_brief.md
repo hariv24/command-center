@@ -1,52 +1,43 @@
 # Daily Brief Workflow
 
 ## Objective
-Every morning, pull the top relevant stories from Hacker News and Reddit on Hariv's tracked topics. Summarize them with context, arguments, and what they mean specifically for his businesses and goals.
+Every morning, pull 7 stories across different angles from Hacker News and Reddit, analyze each in depth, and close with a "Board's Verdict" — the 7 advisors' collective read on what the day's news means for Hariv's goals. Selection is goal-aware: the AI & TECH and STARTUP & BUSINESS slots are boosted toward stories that match his active goals or open pipeline deals, not just generic topic keywords.
 
-## Topics Tracked
-- AI agents, LLMs, new model releases (Claude, GPT, Gemini, etc.)
-- LLM replacing developers / SaaS disruption
-- Vertical SaaS news
-- Automation tools (n8n, no-code, agentic)
-- Startup/founder stories
-- India tech scene
+## Categories (one story each, 7 total)
+HOTTEST, VIRAL, MOST CONTROVERSIAL, BREAKING, AI & TECH, STARTUP & BUSINESS, WILDCARD — see `CATEGORIES` in `tools/daily_brief.py`.
 
 ## Sources
-- Hacker News (top 40 stories)
-- r/MachineLearning, r/LocalLLaMA, r/artificial, r/SaaS, r/startups, r/ChatGPT, r/ClaudeAI
+- Hacker News (top 80 + newest 20 stories, up to 6 comments each)
+- Reddit (11 subreddits — see `REDDIT_SUBS` in `tools/daily_brief.py`): MachineLearning, LocalLLaMA, artificial, SaaS, startups, ChatGPT, ClaudeAI, singularity, programming, technology, Entrepreneur
 
 ## How to Run
 ```bash
 cd /Users/harivkannan/Desktop/DOLLA/agent
 python tools/daily_brief.py
 ```
+In production this runs automatically at 5:00am IST via `POST /api/cron/intel` (see `deploy/setup_server.sh`), then gets pushed to Telegram at 6:00am.
 
 ## Output Structure
-For the top 5 relevant stories:
-- What happened
-- The argument (what people are debating)
-- What this means for Hariv specifically
-- Signal strength: 🔥 Must know / ⚡ Worth knowing / 📌 Keep on radar
+For each of the 7 stories:
+- What's happening and why it matters
+- What the community is actually saying
+- Arguments for / against
+- What happens next — bull case, bear case, signals to watch
+- Direct implications for Hariv (explicitly tied to the matched goal/deal when the story was goal-boosted)
 
-Then: Board's Take — what the 7 advisors would tell Hariv based on today's news.
+Then: **Board's Verdict** — the Pattern, the Bet, the Warning, as if all 7 advisors read the day's stories together.
 
-Brief is also saved to `.tmp/brief_YYYY-MM-DD.md`
+Brief is saved to `briefs/YYYY-MM-DD.md`.
 
 ## When to Run
-Every morning before starting work. Takes ~60 seconds.
+Automatic at 5am IST. Manual runs are idempotent-safe but will regenerate and overwrite today's file.
 
 ## Setup (First Time)
-```bash
-pip install anthropic python-dotenv
-# Add your ANTHROPIC_API_KEY to agent/.env
-```
+Uses the same provider chain as the rest of the app — no separate setup needed. Requires `OPENROUTER_API_KEY` (and/or `GROQ_API_KEY`, `TOGETHER_API_KEY`) in `agent/.env`. See `llm.py`.
 
 ## Adding More Topics
-Edit the `TOPICS` list in `tools/daily_brief.py`.
+Edit `AI_TECH_TOPICS` / `STARTUP_BIZ_TOPICS` in `tools/daily_brief.py` for the keyword-based relevance filter. Goal-driven boosting (`build_goal_keywords`) pulls automatically from `data/goals.json` and `data/pipeline.json` — no manual edit needed as goals/pipeline change.
 Edit `REDDIT_SUBS` to add more subreddits.
 
-## Automating (Optional)
-To run automatically every morning, add to crontab:
-```
-0 7 * * * cd /Users/harivkannan/Desktop/DOLLA/agent && python tools/daily_brief.py
-```
+## Automating
+Already wired via `deploy/setup_server.sh`'s cron block (`0 5 * * * curl -s -X POST http://localhost:4000/api/cron/intel`). The endpoint is idempotent — skips if today's brief already exists.

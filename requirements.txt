@@ -1,0 +1,14 @@
+# Server runtime dependencies — install with: pip install -r requirements.txt
+# Deliberately excludes sentence-transformers/torch (see requirements-build.txt) —
+# that combination OOM'd a 1GB VM. fastembed (ONNX runtime) covers RAG queries
+# at a fraction of the memory footprint.
+
+Flask==3.1.3
+python-dotenv==1.2.2
+groq==1.5.0
+openai==2.44.0
+pypdf==6.14.2
+chromadb==1.5.9
+fastembed==0.8.0
+gunicorn==23.0.0
+requests==2.34.2

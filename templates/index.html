@@ -357,6 +357,21 @@ select option{background:var(--s2)}
   /* hide sidebar countdowns on very small */
   .sb-cd{display:none}
 }
+
+/* Toast notifications — replaces alert() */
+.toast-wrap{position:fixed;bottom:20px;right:20px;z-index:9999;display:flex;flex-direction:column;gap:8px;max-width:360px}
+.toast{background:var(--s2);border:1px solid var(--h2);border-left:3px solid var(--t3);padding:12px 14px;font-size:12px;color:var(--t1);box-shadow:0 8px 24px rgba(0,0,0,.4);animation:fadeUp .25s ease}
+.toast.err{border-left-color:var(--red)}
+.toast.ok{border-left-color:var(--mint)}
+.toast-fade{opacity:0;transition:opacity .3s ease}
+
+/* Streaming advisor cards */
+.acard.streaming{border-left-style:dashed}
+.acard.streaming .atxt::after{content:'▍';animation:pulse 1s infinite;color:var(--t3);margin-left:2px}
+.acard.err{border-left-color:var(--red)!important;opacity:.7}
+
+/* Inline two-tap delete confirm */
+.confirm-armed{background:var(--red)!important;color:#fff!important}
 </style>
 </head>
 <body>
@@ -393,7 +408,7 @@ select option{background:var(--s2)}
       <svg class="si-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M3 9l9-7 9 7v11a2 2 0 01-2 2H5a2 2 0 01-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></svg>Home
     </button>
     <div class="sb-grp" style="margin-top:2px">Wealth Path</div>
-    <button class="si reveal" style="animation-delay:.08s" onclick="go('board',this)">
+    <button class="si reveal" id="si-board" style="animation-delay:.08s" onclick="go('board',this)">
       <svg class="si-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M17 21v-2a4 4 0 00-4-4H5a4 4 0 00-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 00-3-3.87"/><path d="M16 3.13a4 4 0 010 7.75"/></svg>Board
     </button>
     <button class="si reveal" style="animation-delay:.12s" onclick="go('intel',this)">
@@ -402,7 +417,7 @@ select option{background:var(--s2)}
     <button class="si reveal" style="animation-delay:.16s" onclick="go('goals',this)">
       <svg class="si-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>Goals
     </button>
-    <button class="si reveal" style="animation-delay:.2s" onclick="go('decisions',this)">
+    <button class="si reveal" id="si-decisions" style="animation-delay:.2s" onclick="go('decisions',this)">
       <svg class="si-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 01-9 9"/></svg>Decisions
     </button>
     <button class="si reveal" style="animation-delay:.24s" onclick="go('convictions',this)">
@@ -433,6 +448,7 @@ select option{background:var(--s2)}
 
 <!-- HOME -->
 <div class="panel on" id="panel-home">
+  <div id="brokenBanner" style="display:none;background:var(--red);color:#fff;border-radius:8px;padding:10px 14px;margin-bottom:12px;font-size:12px;font-weight:700;letter-spacing:.2px"></div>
   <div class="ns">
     <div class="ns-seg">
       <div class="ns-top"><div class="ns-dot" style="background:var(--mint)"></div>PHASE 1 · GET TO NYC</div>
@@ -499,8 +515,14 @@ select option{background:var(--s2)}
       <div class="stat-row sm-mint" id="pc-s"><div class="st-n" id="pc-sn">0</div><div><div class="st-l">Log Streak</div><div class="st-s">consecutive days</div></div></div>
       <div class="stat-row sm-gold" id="pc-r"><div class="st-n" id="pc-rn">—</div><div><div class="st-l">Board Recs</div><div class="st-s">pending action</div></div></div>
       <div class="stat-row sm-dim" id="pc-f"><div class="st-n" id="pc-fn">—</div><div><div class="st-l">Follow-ups</div><div class="st-s">overdue</div></div></div>
+      <div class="stat-row sm-dim" id="pc-c"><div class="st-n" id="pc-cn">—</div><div><div class="st-l">Commitments</div><div class="st-s" id="pc-cs">kept vs broken</div></div></div>
       <div id="ydayBlock" style="display:none"><div class="yday"><div class="yday-l">Yesterday</div><div id="ydayC"></div></div></div>
-      <div class="slabel" style="margin-top:4px">People to Follow Up</div>
+      <div class="slabel" style="margin-top:4px">Pipeline & MRR Gap</div>
+      <div id="mrrgap" style="background:var(--s2);border:1px solid var(--h1);padding:11px;margin-bottom:10px"><div style="font-size:11px;color:var(--t3)">Loading...</div></div>
+      <div id="calibblock" style="display:none;background:var(--s2);border:1px solid var(--gold);border-left:3px solid var(--gold);padding:10px;margin-bottom:10px;font-size:11px;color:var(--t2)"></div>
+      <div class="slabel">Goal Velocity</div>
+      <div id="gvelblock" style="background:var(--s2);border:1px solid var(--h1);padding:11px;margin-bottom:10px"><div style="font-size:11px;color:var(--t3)">Loading...</div></div>
+      <div class="slabel">People to Follow Up</div>
       <div id="ppl" style="background:var(--s2);border:1px solid var(--h1);padding:11px"><div style="font-size:11px;color:var(--t3)">Loading...</div></div>
     </div>
   </div>
@@ -512,6 +534,13 @@ select option{background:var(--s2)}
     </div>
     <div class="card" style="padding:16px 18px">
       <div id="weekly-body" style="font-size:13px;line-height:1.7;color:var(--t2)"></div>
+      <div style="margin-top:14px;border-top:1px solid var(--h1);padding-top:12px">
+        <div class="slabel" style="margin-bottom:6px">This Week's ONE Priority</div>
+        <div style="display:flex;gap:8px">
+          <input id="weekly-priority" type="text" placeholder="The single highest-leverage thing this week" style="flex:1;background:var(--s2);border:1px solid var(--h2);color:var(--t1);padding:8px 10px;font-size:12px">
+          <button class="btn btn-mint sm" onclick="savePriority()">Confirm</button>
+        </div>
+      </div>
     </div>
   </div>
 </div>
@@ -534,12 +563,34 @@ select option{background:var(--s2)}
     </div>
   </div>
   <div class="topa">
+    <div><div class="slabel" style="margin-bottom:3px">Pipeline</div><div style="font-size:10px;color:var(--t3)" id="pipesum"></div></div>
+    <button class="btn bg sm" onclick="showAddLead()">+ Lead</button>
+  </div>
+  <div id="pipeadd" style="display:none;background:var(--s2);border:1px solid var(--h1);padding:12px;margin-bottom:12px">
+    <div style="display:flex;gap:8px;margin-bottom:8px;flex-wrap:wrap">
+      <input id="pl-name" type="text" placeholder="Name / company" style="flex:2;min-width:140px;background:var(--s1);border:1px solid var(--h2);color:var(--t1);padding:7px 9px;font-size:12px">
+      <input id="pl-mrr" type="number" placeholder="MRR value ₹" style="flex:1;min-width:100px;background:var(--s1);border:1px solid var(--h2);color:var(--t1);padding:7px 9px;font-size:12px">
+      <select id="pl-stage" style="background:var(--s1);border:1px solid var(--h2);color:var(--t1);padding:7px 9px;font-size:11px">
+        <option value="lead">Lead</option><option value="contacted">Contacted</option><option value="demo">Demo</option>
+        <option value="proposal">Proposal</option><option value="won">Won</option><option value="lost">Lost</option>
+      </select>
+    </div>
+    <div style="display:flex;gap:8px">
+      <input id="pl-next" type="text" placeholder="Next action" style="flex:1;background:var(--s1);border:1px solid var(--h2);color:var(--t1);padding:7px 9px;font-size:12px">
+      <button class="btn btn-mint sm" onclick="addLead()">Save</button>
+    </div>
+  </div>
+  <div id="pipel" style="margin-bottom:18px"><div class="empty">No pipeline entries yet.</div></div>
+  <div class="topa">
     <div><div class="slabel" style="margin-bottom:3px">Recommendations</div><div style="font-size:10px;color:var(--t3)" id="recpct"></div></div>
     <button class="btn bg sm" onclick="loadRecs()">Refresh</button>
   </div>
   <div id="recsl" style="margin-bottom:18px"><div class="empty">Run a board session to generate recommendations.</div></div>
   <div class="slabel">Full Session</div>
   <textarea id="qin" rows="4" placeholder="Bring a real decision, a plan to stress-test, or a blocker you can't get past. Cmd+Enter."></textarea>
+  <label style="display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;color:var(--t2);cursor:pointer">
+    <input type="checkbox" id="bd-debate" style="cursor:pointer"> Let them debate — one extra round where advisors react to each other
+  </label>
   <button class="btn btn-m" id="bdb" onclick="runBoard()" style="margin-top:9px">Convene the Board</button>
   <div class="err" id="bderr"></div>
   <div class="bspin" id="bdspin">
@@ -574,7 +625,7 @@ select option{background:var(--s2)}
       </div>
       <div class="slabel" style="margin-bottom:8px;font-size:9px">Follow up</div>
       <div style="display:flex;gap:8px">
-        <input id="bd-fu-input" type="text" placeholder="Push back, go deeper, or pick one advisor above..." style="flex:1;background:var(--s2);border:1px solid var(--bdr);color:var(--t1);padding:9px 12px;font-size:13px;font-family:var(--ff);outline:none">
+        <input id="bd-fu-input" type="text" placeholder="Push back, go deeper, or pick one advisor above..." style="flex:1;background:var(--s2);border:1px solid var(--h2);color:var(--t1);padding:9px 12px;font-size:13px;font-family:var(--fw);outline:none">
         <button class="btn btn-m sm" id="bd-fu-btn" onclick="submitFollowup()">Ask</button>
       </div>
       <div class="err" id="bd-fu-err"></div>
@@ -639,6 +690,7 @@ select option{background:var(--s2)}
         <div class="fg"><label>What did you decide?</label><textarea id="dd" rows="2" placeholder="Stop waiting for Shakti. Start outreach to 5 new manufacturers this week."></textarea></div>
         <div class="fg"><label>Context / alternatives</label><textarea id="dc" rows="2" placeholder="Was going to wait. Single-client risk too high."></textarea></div>
         <div class="g2" style="gap:9px"><div class="fg" style="margin-bottom:0"><label>Date</label><input type="date" id="ddate"></div><div class="fg" style="margin-bottom:0"><label>Confidence (1-10)</label><input type="number" id="dconf" min="1" max="10" value="7"></div></div>
+        <div class="fg"><label>Review this on (optional)</label><input type="date" id="dreview"></div>
         <button class="btn btn-gold sm" onclick="addDec()" style="margin-top:11px">Log Decision</button>
       </div>
     </div>
@@ -808,7 +860,7 @@ function go(name,el){
   document.querySelectorAll('.si').forEach(s=>s.classList.remove('on'));
   document.getElementById('panel-'+name).classList.add('on');
   el.classList.add('on');
-  const L={board:loadRecs,intel:loadIntelHist,goals:loadGoals,decisions:loadDecs,convictions:()=>{loadConvictions();loadConvTrainHistory();},vitals:loadVitalsHist,money:loadFinance,history:loadHistory};
+  const L={board:()=>{loadRecs();loadPipeline();},intel:loadIntelHist,goals:loadGoals,decisions:loadDecs,convictions:()=>{loadConvictions();loadConvTrainHistory();},vitals:loadVitalsHist,money:loadFinance,history:loadHistory};
   if(L[name])L[name]();
   // close mobile sidebar
   if(window.innerWidth<=768){
@@ -842,6 +894,33 @@ async function initHome(){
   const fov=d.overdue_follow_ups??0;
   document.getElementById('pc-fn').textContent=fov;
   if(fov>0)document.getElementById('pc-f').className='stat-row sm-red';
+
+  const cs=d.commitment_scoreboard;
+  if(cs){
+    document.getElementById('pc-cn').textContent=cs.kept_ratio_pct!=null?cs.kept_ratio_pct+'%':'—';
+    document.getElementById('pc-cs').textContent=`${cs.kept} kept · ${cs.broken} broken`;
+    document.getElementById('pc-c').className='stat-row '+(cs.broken>0?'sm-red':cs.kept>0?'sm-mint':'sm-dim');
+    const banner=document.getElementById('brokenBanner');
+    if(cs.broken>0){
+      banner.textContent=`⚠ ${cs.broken} broken commitment${cs.broken>1?'s':''} to the board — ${cs.kept} kept (${cs.kept_ratio_pct}%). See Board Recs.`;
+      banner.style.display='block';
+    }else{
+      banner.style.display='none';
+    }
+  }
+  if(d.calibration&&d.calibration.verdict){
+    document.getElementById('calibblock').style.display='block';
+    document.getElementById('calibblock').textContent=d.calibration.verdict;
+  }
+  const gv=d.goal_velocity||{};
+  const gvEntries=Object.values(gv);
+  const gvColor={moving:'var(--mint)',slow:'var(--gold)',stalled:'var(--red)'};
+  document.getElementById('gvelblock').innerHTML=gvEntries.length
+    ?gvEntries.map(g=>`<div style="display:flex;justify-content:space-between;align-items:center;padding:4px 0;font-size:11px">
+        <span style="color:var(--t2)">${esc(g.title)}</span>
+        <span style="color:${gvColor[g.velocity]||'var(--t3)'};font-weight:700;font-size:9px;letter-spacing:1px;text-transform:uppercase">${g.velocity}</span>
+      </div>`).join('')
+    :'<div style="font-size:11px;color:var(--t3)">No active goals.</div>';
   if(d.yesterday_log){
     document.getElementById('ydayBlock').style.display='block';
     const y=d.yesterday_log;
@@ -857,7 +936,26 @@ async function initHome(){
     if(t.tomorrow)document.getElementById('lgt').value=t.tomorrow;
     if(t.energy){document.getElementById('lge').value=t.energy;document.getElementById('lgev').textContent=t.energy;}
   }
-  loadPeople();setMode(curMode);genBrief();loadWeekly();
+  loadPeople();loadMrrGap();setMode(curMode);genBrief();loadWeekly();
+}
+
+function loadMrrGap(){
+  fetch('/api/pipeline/summary').then(r=>r.json()).then(g=>{
+    const b=document.getElementById('mrrgap');
+    const pct=g.target?Math.min(100,Math.round(g.current_mrr/g.target*100)):0;
+    const barColor=pct>=70?'var(--mint)':pct>=35?'var(--gold)':'var(--red)';
+    let html=`<div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:6px">
+      <span style="font-family:var(--fm);font-size:15px;font-weight:700;color:${barColor}">₹${g.current_mrr.toLocaleString('en-IN')}</span>
+      <span style="font-size:10px;color:var(--t3)">/ ₹${g.target.toLocaleString('en-IN')} target</span></div>
+    <div style="height:5px;background:var(--h1);margin-bottom:8px"><div style="height:100%;width:${pct}%;background:${barColor}"></div></div>`;
+    if(g.months_left!=null){
+      html+=`<div style="font-size:10px;color:var(--t3)">${g.months_left}mo left · needs <b style="color:var(--t1)">₹${(g.required_new_mrr_per_month||0).toLocaleString('en-IN')}</b>/mo new MRR</div>`;
+    }
+    if(g.runway&&g.runway.trend==='burning'){
+      html+=`<div style="font-size:10px;color:var(--red);margin-top:4px">⚠ Burning ₹${Math.abs(g.runway.net_monthly).toLocaleString('en-IN')}/mo net</div>`;
+    }
+    b.innerHTML=html;
+  }).catch(()=>{document.getElementById('mrrgap').innerHTML='<div style="font-size:11px;color:var(--t3)">No pipeline data yet.</div>';});
 }
 async function loadWeekly(){
   const d=await fetch('/api/weekly').then(r=>r.json()).catch(()=>({}));
@@ -865,6 +963,12 @@ async function loadWeekly(){
   document.getElementById('weekly-wrap').style.display='block';
   document.getElementById('weekly-date').textContent=d.date||'';
   document.getElementById('weekly-body').innerHTML=marked.parse(d.content);
+  fetch('/api/weekly/priority').then(r=>r.json()).then(p=>{if(p.priority)document.getElementById('weekly-priority').value=p.priority;}).catch(()=>{});
+}
+async function savePriority(){
+  const p=document.getElementById('weekly-priority').value.trim();if(!p)return;
+  await post('/api/weekly/priority',{priority:p});
+  toast('Priority confirmed for the week.','ok');
 }
 
 async function loadPeople(){
@@ -900,7 +1004,7 @@ async function saveLog(){
     await post('/api/daily-log',{did:document.getElementById('lgd').value,didnt:document.getElementById('lgdn').value,tomorrow:document.getElementById('lgt').value,energy:document.getElementById('lge').value});
     const ok=document.getElementById('lgo');ok.style.display='block';setTimeout(()=>ok.style.display='none',5000);
     initHome();
-  }catch(e){alert('Error: '+e.message);}
+  }catch(e){toast('Error: '+e.message,'err');}
   finally{b.disabled=false;b.textContent='Save Log';}
 }
 
@@ -927,6 +1031,52 @@ async function runQuick(){
 }
 document.getElementById('qqi')?.addEventListener('keydown',e=>{if(e.key==='Enter')runQuick()});
 
+const PIPE_STAGES=['lead','contacted','demo','proposal','won','lost'];
+const PIPE_COLORS={lead:'var(--t3)',contacted:'var(--sky)',demo:'var(--violet)',proposal:'var(--gold)',won:'var(--mint)',lost:'var(--red)'};
+
+function showAddLead(){
+  const el=document.getElementById('pipeadd');
+  el.style.display=el.style.display==='none'?'block':'none';
+}
+
+async function loadPipeline(){
+  const entries=await fetch('/api/pipeline').then(r=>r.json()).catch(()=>[]);
+  const list=document.getElementById('pipel');
+  const open=entries.filter(p=>!['won','lost'].includes(p.stage));
+  const won=entries.filter(p=>p.stage==='won');
+  document.getElementById('pipesum').textContent=entries.length
+    ?`${won.length} won · ${open.length} open · ₹${won.reduce((s,p)=>s+(p.mrr_value||0),0).toLocaleString('en-IN')} MRR`:'';
+  if(!entries.length){list.innerHTML='<div class="empty">No pipeline entries yet. Add a lead above.</div>';return;}
+  list.innerHTML=entries.map(p=>`<div class="rec ${p.stage==='won'?'rec-d':'rec-p'}">
+    <div style="flex:1">
+      <div class="rec-txt">${esc(p.name)} ${p.mrr_value?`<span style="color:var(--t3);font-family:var(--fm);font-size:10px">₹${p.mrr_value.toLocaleString('en-IN')}/mo</span>`:''}</div>
+      <div class="rec-meta">${esc(p.next_action||'—')}${p.next_action_date?' · '+p.next_action_date:''}</div>
+    </div>
+    <select onchange="updateLeadStage('${p.id}',this.value)" style="background:var(--s1);border:1px solid var(--h2);color:${PIPE_COLORS[p.stage]||'var(--t2)'};padding:4px 6px;font-size:10px;font-weight:700;text-transform:uppercase">
+      ${PIPE_STAGES.map(s=>`<option value="${s}" ${s===p.stage?'selected':''}>${s}</option>`).join('')}
+    </select>
+    <button class="xb" onclick="delLead(this,'${p.id}')" style="margin-left:6px">×</button>
+  </div>`).join('');
+}
+async function addLead(){
+  const name=document.getElementById('pl-name').value.trim();
+  if(!name){toast('Name required','err');return;}
+  await post('/api/pipeline',{
+    name,
+    mrr_value:document.getElementById('pl-mrr').value||0,
+    stage:document.getElementById('pl-stage').value,
+    next_action:document.getElementById('pl-next').value,
+  });
+  document.getElementById('pl-name').value='';document.getElementById('pl-mrr').value='';document.getElementById('pl-next').value='';
+  document.getElementById('pipeadd').style.display='none';
+  loadPipeline();loadMrrGap();
+}
+async function updateLeadStage(id,stage){
+  await fetch(`/api/pipeline/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({stage})});
+  loadPipeline();loadMrrGap();
+}
+async function delLead(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/pipeline/${id}`,{method:'DELETE'});loadPipeline();loadMrrGap();});}
+
 async function loadRecs(){
   const recs=await fetch('/api/recommendations').then(r=>r.json()).catch(()=>[]);
   const list=document.getElementById('recsl');
@@ -942,23 +1092,129 @@ async function actionRec(id){await fetch(`/api/recommendations/${id}`,{method:'P
 
 let boardConversation=[];
 
+function _slug(name){return name.replace(/\s+/g,'-').toLowerCase();}
+
+// Builds an empty streaming card shell for one advisor — filled in token-by-token
+// as advisor_token events arrive, finalized (streaming class removed) on advisor_done.
+function _liveAdvisorCard(name){
+  const info=AC[name]||{};
+  return `<div class="acard streaming" data-advisor="${esc(name)}" style="border-left-color:${info.color||'#888'}">
+    <div class="acard-head">${advPhoto(name)}<div><div class="aname" style="color:${info.color||'#888'}">${name}</div><div class="arole">${info.role||''}</div></div></div>
+    <div class="atxt" data-role="text"></div>
+  </div>`;
+}
+
+function _advisorCards(responses){
+  return responses.map(r=>`
+    <div class="acard" data-advisor="${esc(r.name)}" style="border-left-color:${r.color}">
+      <div class="acard-head">${advPhoto(r.name)}<div><div class="aname" style="color:${r.color}">${r.name}</div><div class="arole">${r.role}</div></div></div>
+      <div class="atxt" data-role="text">${esc(r.response)}</div>
+    </div>`).join('');
+}
+
+// Drives one streaming board/followup call: renders routing badges + empty
+// advisor cards as soon as routing arrives, fills each card's text live as
+// tokens stream in, finalizes cards on advisor_done, and resolves with the
+// full turn data once the "done" event fires (or rejects on "error").
+function _driveStream(url,body,{gridEl,routeEl,onRouting}){
+  return new Promise((resolve,reject)=>{
+    const collected={advisors:[],reasons:{},responses:{},synthesis:'',sessionId:null,turnNumber:null};
+    let sawError=null;
+    streamSSE(url,body,evt=>{
+      if(evt.event==='routing'){
+        collected.advisors=evt.advisors||[];collected.reasons=evt.reasons||{};
+        if(gridEl)gridEl.innerHTML=collected.advisors.map(n=>_liveAdvisorCard(n)).join('');
+        if(onRouting)onRouting(collected.advisors,collected.reasons);
+      }else if(evt.event==='advisor_token'){
+        const card=gridEl&&gridEl.querySelector(`[data-advisor="${CSS.escape(evt.advisor)}"] [data-role="text"]`);
+        if(card)card.textContent+=evt.delta;
+      }else if(evt.event==='advisor_done'){
+        collected.responses[evt.advisor]={content:evt.content,model:evt.model};
+        const cardWrap=gridEl&&gridEl.querySelector(`[data-advisor="${CSS.escape(evt.advisor)}"]`);
+        if(cardWrap){
+          cardWrap.classList.remove('streaming');
+          if(evt.content&&evt.content.startsWith('error:'))cardWrap.classList.add('err');
+        }
+      }else if(evt.event==='synthesis_token'){
+        collected.synthesis+=evt.delta;
+      }else if(evt.event==='error'){
+        sawError=evt.message;toast(evt.message,'err');
+      }else if(evt.event==='done'){
+        collected.sessionId=evt.session_id;collected.turnNumber=evt.turn_number;
+      }
+    }).then(()=>{
+      if(!collected.sessionId&&sawError)reject(new Error(sawError));
+      else resolve(collected);
+    }).catch(reject);
+  });
+}
+
 async function runBoard(){
   const q=document.getElementById('qin').value.trim();if(!q)return;
   const b=document.getElementById('bdb');b.disabled=true;b.textContent='Convening...';
   document.getElementById('bdspin').classList.add('on');document.getElementById('bdr').style.display='none';document.getElementById('bderr').classList.remove('on');
   try{
-    const d=await post('/api/board',{question:q});if(d.error)throw new Error(d.error);
-    curSessId=d.session_id;boardConversation=[];renderBoard(d);
-  }catch(e){const el=document.getElementById('bderr');el.textContent='Error: '+e.message;el.classList.add('on');}
+    const gridEl=document.getElementById('bdgrid');
+    document.getElementById('bdsynth').innerHTML='';
+    document.getElementById('bd-thread').innerHTML='';
+    const collected=await _driveStream('/api/board/stream',{question:q},{
+      gridEl,
+      routeEl:document.getElementById('bdroute'),
+      onRouting:(advisors,reasons)=>{
+        document.getElementById('bdspin').classList.remove('on');
+        document.getElementById('bdr').style.display='block';
+        document.getElementById('bdr').scrollIntoView({behavior:'smooth',block:'start'});
+        document.getElementById('bdmeta').textContent=`Session · ${new Date().toLocaleString()}`;
+        document.getElementById('bdq').textContent=q;
+        const skip=Object.keys(AC).filter(n=>!advisors.includes(n));
+        document.getElementById('bdroute').innerHTML='<span style="letter-spacing:2px;margin-right:5px">ROUTED TO:</span>'+
+          advisors.map(n=>{
+            const reason=reasons[n]?`<div style="font-size:8px;color:var(--t3);margin-top:1px">${esc(reasons[n])}</div>`:'';
+            return`<span class="rb" style="color:${(AC[n]||{}).color||'#888'};border-color:${(AC[n]||{}).color||'#888'}44;display:inline-flex;flex-direction:column;padding:4px 8px">${n}${reason}</span>`;
+          }).join('')+(skip.length?`<span style="opacity:.3">${skip.length} not convened</span>`:'');
+        _populateTargetAdvisorSelect(advisors);
+      }
+    });
+    curSessId=collected.sessionId;
+    document.getElementById('bdsynth').innerHTML=marked.parse(collected.synthesis||'');
+    document.getElementById('bd-fu-input').value='';
+    document.getElementById('bd-fu-err').classList.remove('on');
+    const responses=collected.advisors.map(name=>{
+      const r=collected.responses[name]||{};
+      const info=AC[name]||{};
+      return {name,role:info.role||'',color:info.color||'#888',response:r.content||''};
+    });
+    boardConversation=[{question:q,synthesis:collected.synthesis,responses,target_advisor:null}];
+    loadRecs();
+    if(document.getElementById('bd-debate').checked&&collected.advisors.length>1){
+      await runDebateRound();
+    }
+  }catch(e){
+    document.getElementById('bdspin').classList.remove('on');
+    const el=document.getElementById('bderr');el.textContent='Error: '+e.message;el.classList.add('on');
+    toast('Board session failed: '+e.message,'err');
+  }
   finally{b.disabled=false;b.textContent='Convene the Board';document.getElementById('bdspin').classList.remove('on');}
 }
 
-function _advisorCards(responses){
-  return responses.map(r=>`
-    <div class="acard" style="border-left-color:${r.color}">
-      <div class="acard-head">${advPhoto(r.name)}<div><div class="aname" style="color:${r.color}">${r.name}</div><div class="arole">${r.role}</div></div></div>
-      <div class="atxt">${esc(r.response)}</div>
-    </div>`).join('');
+// One extra round: each advisor reacts explicitly to what the others just
+// said — this is what makes it feel like a meeting instead of parallel
+// monologues. Reuses the followup-stream endpoint with a canned prompt and a
+// tighter token cap (real disagreement fits in a few sentences).
+async function runDebateRound(){
+  const debateQ="React to what the other advisors just said above. State explicitly where you agree and where you'd push back — call them out by name if you disagree. Under 150 words, no preamble.";
+  const {gridEl,synthSlot}=_liveTurnShell(boardConversation.length+1,'[Board deliberation round]',null);
+  try{
+    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:debateQ,max_tokens:280},{gridEl});
+    const responses=collected.advisors.map(name=>{
+      const r=collected.responses[name]||{};
+      const info=AC[name]||{};
+      return {name,role:info.role||'',color:info.color||'#888',response:r.content||''};
+    });
+    boardConversation.push({question:debateQ,synthesis:'',responses,target_advisor:null});
+  }catch(e){
+    toast('Debate round failed: '+e.message,'err');
+  }
 }
 
 function _populateTargetAdvisorSelect(advisorNames){
@@ -1024,25 +1280,52 @@ function renderBoard(d){
   loadRecs();
 }
 
+// Creates an empty turn shell (divider + question banner + empty agrid) in
+// the thread and returns its .agrid element so the stream driver can fill it live.
+function _liveTurnShell(turnNum,question,targetAdvisor){
+  const thread=document.getElementById('bd-thread');
+  const el=document.createElement('div');
+  el.className='bd-turn';
+  const label=targetAdvisor
+    ? `TURN ${turnNum} — TO ${targetAdvisor.split(' ').slice(-1)[0].toUpperCase()}`
+    : `TURN ${turnNum}`;
+  el.innerHTML=`
+    <div class="bd-turn-divider"><div class="bd-turn-line"></div><span class="bd-turn-label">${label}</span><div class="bd-turn-line"></div></div>
+    <div class="qbanner" style="margin-bottom:10px">${esc(question)}</div>
+    <div class="agrid"></div>
+    <div class="synth-slot"></div>`;
+  thread.appendChild(el);
+  el.scrollIntoView({behavior:'smooth',block:'start'});
+  return {turnEl:el,gridEl:el.querySelector('.agrid'),synthSlot:el.querySelector('.synth-slot')};
+}
+
 async function submitFollowup(){
   const q=document.getElementById('bd-fu-input').value.trim();if(!q||!curSessId)return;
   const btn=document.getElementById('bd-fu-btn');
   btn.disabled=true;btn.textContent='...';
   document.getElementById('bd-fu-err').classList.remove('on');
   const targetAdvisor=document.getElementById('bd-target-adv').value||null;
+  const {gridEl,synthSlot}=_liveTurnShell(boardConversation.length+1,q,targetAdvisor);
   try{
-    const d=await post(`/api/board/${curSessId}/followup`,{question:q,advisor:targetAdvisor||undefined});
-    if(d.error)throw new Error(d.error);
-    boardConversation.push({question:q,synthesis:d.turn.synthesis,responses:d.turn.responses,target_advisor:targetAdvisor});
-    appendTurnToThread(d.turn,boardConversation.length);
+    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:q,advisor:targetAdvisor||undefined},{gridEl});
+    if(collected.synthesis){
+      synthSlot.innerHTML=`<div class="synth" style="margin-top:10px"><div class="slabel">Synthesis</div><div class="synth-body">${marked.parse(collected.synthesis)}</div></div>`;
+    }
+    const responses=collected.advisors.map(name=>{
+      const r=collected.responses[name]||{};
+      const info=AC[name]||{};
+      return {name,role:info.role||'',color:info.color||'#888',response:r.content||''};
+    });
+    boardConversation.push({question:q,synthesis:collected.synthesis,responses,target_advisor:targetAdvisor});
     document.getElementById('bd-fu-input').value='';
     document.getElementById('bd-target-adv').value='';
   }catch(e){
     const el=document.getElementById('bd-fu-err');el.textContent='Error: '+e.message;el.classList.add('on');
+    toast('Follow-up failed: '+e.message,'err');
   }finally{btn.disabled=false;btn.textContent='Ask';}
 }
 
-function openSaveDec(){go('decisions',document.querySelectorAll('.si')[4]);document.getElementById('dc').value=document.getElementById('bdsynth').textContent.slice(0,250);document.getElementById('dd').focus();}
+function openSaveDec(){go('decisions',document.getElementById('si-decisions'));document.getElementById('dc').value=document.getElementById('bdsynth').textContent.slice(0,250);document.getElementById('dd').focus();}
 document.getElementById('qin').addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')runBoard()});
 document.getElementById('bd-fu-input').addEventListener('keydown',e=>{if(e.key==='Enter')submitFollowup()});
 
@@ -1052,7 +1335,7 @@ async function loadConvictions(){
   if(cnt)cnt.textContent=cvs.length?cvs.length+' stored':'';
   if(!cvs.length){list.innerHTML='<div class="empty">No convictions extracted yet. Have a training session first.</div>';return;}
   list.innerHTML=cvs.slice().reverse().map(cv=>`<div class="conv-card">
-    <div class="conv-del"><button class="xb" onclick="delConviction('${cv.id}')">×</button></div>
+    <div class="conv-del"><button class="xb" onclick="delConviction(this,'${cv.id}')">×</button></div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
       <span class="conv-tag">${esc(cv.category)}</span>
       <span style="font-family:var(--fm);font-size:10px;color:var(--gold)">${cv.strength}/10</span>
@@ -1092,15 +1375,28 @@ async function sendConvTrain(){
 async function extractConvictions(){
   const btn=document.getElementById('cvExtractBtn');btn.disabled=true;btn.textContent='Extracting...';
   try{
-    const d=await post('/api/conviction-train/extract',{});if(d.error){alert(d.error);return;}
-    if(d.count===0){alert('No strong contrarian positions found yet. Keep arguing.');return;}
+    const d=await post('/api/conviction-train/extract',{});if(d.error){toast(d.error,'err');return;}
+    if(d.count===0){toast('No strong contrarian positions found yet. Keep arguing.');return;}
     loadConvictions();
     const msgs=document.getElementById('cvmsgs');
     msgs.appendChild(mkCvMsg(`Extracted ${d.count} conviction${d.count>1?'s':''} from this session. Stored below.`,'c'));msgs.scrollTop=msgs.scrollHeight;
-  }catch(e){alert('Error: '+e.message);}
+  }catch(e){toast('Error: '+e.message,'err');}
   finally{btn.disabled=false;btn.textContent='Extract Convictions';}
 }
-async function delConviction(id){if(!confirm('Delete?'))return;await fetch(`/api/convictions/${id}`,{method:'DELETE'});loadConvictions();}
+// Inline two-tap delete confirm — first click arms the button (shown red,
+// "Sure?"), second click within 3s actually deletes. Replaces native confirm().
+function _confirmTap(btn,onConfirm){
+  if(btn.dataset.armed==='1'){
+    clearTimeout(btn._armTimer);
+    onConfirm();
+    return;
+  }
+  btn.dataset.armed='1';
+  const original=btn.textContent;
+  btn.textContent='Sure?';btn.classList.add('confirm-armed');
+  btn._armTimer=setTimeout(()=>{btn.dataset.armed='0';btn.textContent=original;btn.classList.remove('confirm-armed');},3000);
+}
+async function delConviction(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/convictions/${id}`,{method:'DELETE'});loadConvictions();});}
 document.getElementById('cvin')?.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')sendConvTrain()});
 
 async function loadIntelHist(){
@@ -1113,39 +1409,60 @@ async function loadBriefDate(date,el){
   const d=await fetch(`/api/briefs/${date}`).then(r=>r.json()).catch(e=>({error:e.message}));
   document.getElementById('ic').innerHTML=marked.parse(d.content||d.error||'');document.getElementById('ic').classList.add('on');document.getElementById('isk').classList.remove('on');
 }
+// Shared driver for the Intel panel's one-shot generators (scan, retro) —
+// they only differ in endpoint, result field, and heading.
+async function _runIntelAction(endpoint,resultField,heading){
+  const ic=document.getElementById('ic'),isk=document.getElementById('isk');
+  ic.classList.remove('on');isk.classList.add('on');
+  try{
+    const d=await post(endpoint,{},{timeoutMs:150000});
+    if(d.error)throw new Error(d.error);
+    const body=heading?`# ${heading}\n\n${d[resultField]}`:d[resultField];
+    ic.innerHTML=marked.parse(body);ic.classList.add('on');
+  }catch(e){
+    ic.innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';ic.classList.add('on');
+    toast(heading||'Action'+' failed: '+e.message,'err');
+  }finally{isk.classList.remove('on');}
+}
+async function runScan(){await _runIntelAction('/api/scan','scan','Opportunity Scan');}
+async function runRetro(){await _runIntelAction('/api/retrospective','retro',null);}
+
 async function runBrief(){
   const ic=document.getElementById('ic'),isk=document.getElementById('isk');
   ic.classList.remove('on');isk.classList.add('on');
   try{
-    const d=await post('/api/brief',{});
+    const d=await post('/api/brief',{},{timeoutMs:150000});
     if(d.error)throw new Error(d.error);
     if(d.brief){
-      ic.innerHTML=marked.parse(d.brief);ic.classList.add('on');loadIntelHist();
+      ic.innerHTML=marked.parse(d.brief);ic.classList.add('on');isk.classList.remove('on');loadIntelHist();
     } else if(d.generating){
       ic.innerHTML='<p style="color:var(--t2);font-size:12px;font-family:var(--fm)">Fetching stories + generating analysis — takes 2-3 min. Checking every 10s...</p>';
       ic.classList.add('on');
-      // Poll until done
+      // Poll until done, capped so a stuck brief doesn't poll forever
+      let attempts=0;
+      const MAX_ATTEMPTS=30; // 5 min at 10s intervals
       const poll=setInterval(async()=>{
+        attempts++;
         try{
           const p=await fetch('/api/brief/poll').then(r=>r.json());
-          if(p.done){clearInterval(poll);isk.classList.remove('on');ic.innerHTML=marked.parse(p.brief);loadIntelHist();}
-        }catch(e){clearInterval(poll);isk.classList.remove('on');}
+          if(p.done){
+            clearInterval(poll);isk.classList.remove('on');
+            ic.innerHTML=marked.parse(p.brief);loadIntelHist();
+          }else if(attempts>=MAX_ATTEMPTS){
+            clearInterval(poll);isk.classList.remove('on');
+            toast('Brief generation timed out after 5 minutes','err');
+          }
+        }catch(e){
+          if(attempts>=MAX_ATTEMPTS){clearInterval(poll);isk.classList.remove('on');toast('Brief polling failed: '+e.message,'err');}
+        }
       },10000);
+    }else{
+      isk.classList.remove('on');
     }
-  }catch(e){ic.innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';ic.classList.add('on');}
-  finally{if(!document.querySelector('.poll-active'))isk.classList.remove('on');}
-}
-async function runScan(){
-  document.getElementById('ic').classList.remove('on');document.getElementById('isk').classList.add('on');
-  try{const d=await post('/api/scan',{});if(d.error)throw new Error(d.error);document.getElementById('ic').innerHTML=marked.parse('# Opportunity Scan\n\n'+d.scan);document.getElementById('ic').classList.add('on');}
-  catch(e){document.getElementById('ic').innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';document.getElementById('ic').classList.add('on');}
-  finally{document.getElementById('isk').classList.remove('on');}
-}
-async function runRetro(){
-  document.getElementById('ic').classList.remove('on');document.getElementById('isk').classList.add('on');
-  try{const d=await post('/api/retrospective',{});if(d.error)throw new Error(d.error);document.getElementById('ic').innerHTML=marked.parse(d.retro);document.getElementById('ic').classList.add('on');}
-  catch(e){document.getElementById('ic').innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';document.getElementById('ic').classList.add('on');}
-  finally{document.getElementById('isk').classList.remove('on');}
+  }catch(e){
+    ic.innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';ic.classList.add('on');isk.classList.remove('on');
+    toast('Brief failed: '+e.message,'err');
+  }
 }
 
 async function loadGoals(){
@@ -1156,7 +1473,7 @@ async function loadGoals(){
     const dl=g.deadline?Math.ceil((new Date(g.deadline)-new Date())/86400000):null;
     const cv=parseFloat(String(g.current||0).replace(/[^0-9.]/g,'')),tv=parseFloat(String(g.target||0).replace(/[^0-9.]/g,''));
     const pct=tv?Math.min(cv/tv*100,100):0;
-    return`<div class="gcard"><div class="gdel"><button class="xb" onclick="delGoal('${g.id}')">×</button></div>
+    return`<div class="gcard"><div class="gdel"><button class="xb" onclick="delGoal(this,'${g.id}')">×</button></div>
       <div class="gt">${esc(g.title)}</div><div class="gm">${g.category}${dl!=null?` · ${dl>0?dl+'d left':'OVERDUE'}`:''}</div>
       ${tv?`<div class="gtrack"><div class="gfill" style="width:${pct.toFixed(0)}%"></div></div>`:''}
       <div class="gst">${g.current?`<b>${esc(String(g.current))}</b>`:''} ${g.target?`→ <b>${esc(String(g.target))}</b>`:''}</div>
@@ -1172,7 +1489,7 @@ async function addGoal(){
   await post('/api/goals',{title:t,category:document.getElementById('gcat').value,deadline:document.getElementById('gd').value,current:document.getElementById('gcur').value,target:document.getElementById('gtgt').value,why:document.getElementById('gwhy').value});
   ['gt','gcur','gtgt','gwhy'].forEach(id=>document.getElementById(id).value='');loadGoals();
 }
-async function delGoal(id){if(!confirm('Delete?'))return;await fetch(`/api/goals/${id}`,{method:'DELETE'});loadGoals();}
+async function delGoal(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/goals/${id}`,{method:'DELETE'});loadGoals();});}
 async function parseTime(){
   const txt=document.getElementById('ttxt').value.trim(),dt=document.getElementById('tdate').value;if(!txt)return;
   const b=document.getElementById('tpb');b.disabled=true;b.textContent='Parsing...';
@@ -1193,7 +1510,7 @@ async function loadDecs(){
   if(!ds.length){cards.innerHTML='<div class="empty">No decisions yet.</div>';return;}
   cards.innerHTML=ds.slice().reverse().map(d=>{
     const cl=d.confidence>=8?'ch':d.confidence>=5?'cm':'cl';
-    return`<div class="dcard"><div class="dacts">${!d.outcome?`<button class="btn bg sm" onclick="openOut('${d.id}')">Outcome</button>`:''}<button class="xb" onclick="delDec('${d.id}')">×</button></div>
+    return`<div class="dcard"><div class="dacts">${!d.outcome?`<button class="btn bg sm" onclick="openOut('${d.id}')">Outcome</button>`:''}<button class="xb" onclick="delDec(this,'${d.id}')">×</button></div>
       <div class="dq">${esc(d.decision)}</div><div class="dc2">${esc(d.context||'')}</div>
       <div class="dmeta"><span>${d.date}</span><span class="conf ${cl}">${d.confidence}/10</span>${d.outcome?'<span class="tag tag-mint">Outcome</span>':''}</div>
       ${d.outcome?`<div class="dout"><b>Outcome:</b> ${esc(d.outcome)}<br><b>Lesson:</b> ${esc(d.lesson||'')}</div>`:''}
@@ -1201,8 +1518,8 @@ async function loadDecs(){
 }
 async function addDec(){
   const dec=document.getElementById('dd').value.trim();if(!dec)return;
-  await post('/api/decisions',{decision:dec,context:document.getElementById('dc').value,date:document.getElementById('ddate').value,confidence:document.getElementById('dconf').value,session_id:curSessId||''});
-  document.getElementById('dd').value='';document.getElementById('dc').value='';loadDecs();
+  await post('/api/decisions',{decision:dec,context:document.getElementById('dc').value,date:document.getElementById('ddate').value,confidence:document.getElementById('dconf').value,review_date:document.getElementById('dreview').value,session_id:curSessId||''});
+  document.getElementById('dd').value='';document.getElementById('dc').value='';document.getElementById('dreview').value='';loadDecs();
 }
 function openOut(id){document.getElementById('outid').value=id;document.getElementById('outmod').style.display='block';document.getElementById('outmod').scrollIntoView({behavior:'smooth'});}
 async function saveOutcome(){
@@ -1210,7 +1527,7 @@ async function saveOutcome(){
   await fetch(`/api/decisions/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({outcome:document.getElementById('outt').value,lesson:document.getElementById('lessl').value})});
   document.getElementById('outmod').style.display='none';document.getElementById('outt').value='';document.getElementById('lessl').value='';loadDecs();
 }
-async function delDec(id){if(!confirm('Delete?'))return;await fetch(`/api/decisions/${id}`,{method:'DELETE'});loadDecs();}
+async function delDec(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/decisions/${id}`,{method:'DELETE'});loadDecs();});}
 
 async function loadVitalsHist(){
   const logs=await fetch('/api/vitals/history').then(r=>r.json()).catch(()=>[]);
@@ -1249,15 +1566,15 @@ function renderExpSum(s){
 function renderExpRows(exps){
   document.getElementById('expc').textContent=exps.length+' total';
   const s=[...exps].sort((a,b)=>b.date.localeCompare(a.date)).slice(0,40);
-  document.getElementById('expr').innerHTML=s.length?s.map(e=>`<div class="tr" style="grid-template-columns:80px 100px 1fr 90px 24px"><span class="tdt">${e.date}</span><span>${e.category}</span><span class="tnote">${esc(e.note||'—')}</span><span class="tamt">₹${e.amount.toLocaleString('en-IN')}</span><button class="xb" onclick="delExp('${e.id}')">×</button></div>`).join(''):'<div class="empty">No expenses.</div>';
+  document.getElementById('expr').innerHTML=s.length?s.map(e=>`<div class="tr" style="grid-template-columns:80px 100px 1fr 90px 24px"><span class="tdt">${e.date}</span><span>${e.category}</span><span class="tnote">${esc(e.note||'—')}</span><span class="tamt">₹${e.amount.toLocaleString('en-IN')}</span><button class="xb" onclick="delExp(this,'${e.id}')">×</button></div>`).join(''):'<div class="empty">No expenses.</div>';
 }
 async function addExp(){
   const a=document.getElementById('eam').value,c=document.getElementById('ecat').value;
-  if(!a||!c){alert('Amount and category required');return;}
+  if(!a||!c){toast('Amount and category required','err');return;}
   await post('/api/expenses',{amount:a,category:c,note:document.getElementById('eno').value,date:document.getElementById('edt').value});
   ['eam','eno'].forEach(id=>document.getElementById(id).value='');document.getElementById('ecat').value='';loadFinance();
 }
-async function delExp(id){await fetch(`/api/expenses/${id}`,{method:'DELETE'});loadFinance();}
+async function delExp(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/expenses/${id}`,{method:'DELETE'});loadFinance();});}
 async function impStmt(input){
   const file=input.files[0];if(!file)return;
   const form=new FormData();form.append('file',file);
@@ -1276,7 +1593,7 @@ async function loadHistory(){
 }
 async function loadSess(id){
   const d=await fetch(`/api/sessions/${id}`).then(r=>r.json());
-  go('board',document.querySelectorAll('.si')[1]);document.getElementById('qin').value=d.question;renderBoard(d);
+  go('board',document.getElementById('si-board'));document.getElementById('qin').value=d.question;renderBoard(d);
 }
 async function loadKB(){
   const d=await fetch('/api/kb').then(r=>r.json()).catch(()=>({content:''}));
@@ -1294,7 +1611,57 @@ async function saveKb(){
 }
 
 function esc(s){return String(s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')}
-async function post(url,body){const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});return r.json()}
+
+function toast(msg,kind){
+  let wrap=document.querySelector('.toast-wrap');
+  if(!wrap){wrap=document.createElement('div');wrap.className='toast-wrap';document.body.appendChild(wrap);}
+  const t=document.createElement('div');t.className='toast'+(kind?' '+kind:'');t.textContent=msg;
+  wrap.appendChild(t);
+  setTimeout(()=>{t.classList.add('toast-fade');setTimeout(()=>t.remove(),320);},kind==='err'?5000:3200);
+}
+
+async function post(url,body,opts={}){
+  const timeoutMs=opts.timeoutMs||30000;
+  const ctrl=new AbortController();
+  const timer=setTimeout(()=>ctrl.abort(),timeoutMs);
+  try{
+    const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal:ctrl.signal});
+    clearTimeout(timer);
+    if(!r.ok){
+      let msg=`Request failed (${r.status})`;
+      try{const j=await r.json();if(j.error)msg=j.error;}catch(_){}
+      throw new Error(msg);
+    }
+    return r.json();
+  }catch(e){
+    clearTimeout(timer);
+    if(e.name==='AbortError')throw new Error('Request timed out');
+    throw e;
+  }
+}
+
+// Consumes a POST endpoint that streams Server-Sent Events (used for board
+// sessions, which take too long for a plain blocking fetch). onEvent(evt)
+// fires per SSE frame; no timeout here since board sessions legitimately run 1-2 min.
+async function streamSSE(url,body,onEvent){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  if(!r.ok){let msg=`Request failed (${r.status})`;try{const j=await r.json();if(j.error)msg=j.error;}catch(_){}throw new Error(msg);}
+  const reader=r.body.getReader();
+  const decoder=new TextDecoder();
+  let buf='';
+  while(true){
+    const {done,value}=await reader.read();
+    if(done)break;
+    buf+=decoder.decode(value,{stream:true});
+    const frames=buf.split('\n\n');
+    buf=frames.pop(); // last (possibly incomplete) frame stays in the buffer
+    for(const frame of frames){
+      const line=frame.split('\n').find(l=>l.startsWith('data: '));
+      if(!line)continue;
+      try{onEvent(JSON.parse(line.slice(6)));}catch(_){}
+    }
+  }
+}
 
 function toggleSidebar(){
   const sb=document.getElementById('sidebar');

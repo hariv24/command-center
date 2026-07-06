@@ -7,7 +7,7 @@ import asyncio
 import json
 import os
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -571,8 +571,8 @@ def save_session(question, responses, synthesis, advisors=None, advisor_reasons=
     SESSIONS_DIR.mkdir(exist_ok=True)
     session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
     flat_responses = [
-        {"name": name, "role": role, "color": color, "response": response}
-        for name, role, color, response in responses
+        {"name": name, "role": role, "color": color, "response": response, "model": model}
+        for name, role, color, response, model in responses
     ]
     turn_1 = {
         "turn": 1,
@@ -660,13 +660,34 @@ def _rag_section(name, question):
     """Retrieved primary-source passages relevant to this question (Phase 3b)."""
     try:
         from tools.query_advisor_rag import retrieve_for_advisor
-        chunks = retrieve_for_advisor(name, question, top_k=8)
+        # Retrieval is local (fastembed + Chroma) and costs nothing against the
+        # OpenRouter request budget — only the prompt tokens grow, which OpenRouter's
+        # free tier doesn't bill for. Raised from 8 now that the corpus is bigger and
+        # richer per-advisor (post Munger/Dalio/Jobs/Bezos enrichment).
+        chunks = retrieve_for_advisor(name, question, top_k=14)
         if chunks:
             quotes = "\n---\n".join(
                 f'"{c["text"]}"\n(Source: {c.get("source", "")}, {c.get("year", "")})'
                 for c in chunks
             )
             return f"\n\n## Things you actually said that may be relevant here:\n{quotes}"
+    except Exception:
+        pass
+    return ""
+
+
+def _personal_history_section(question):
+    """
+    Retrieved specifics from Hariv's own past sessions/logs/decisions — gives
+    advisors a real memory of him ("In May you said Manikandan promised the
+    ERP by June 15") instead of just the curated live-context summary.
+    """
+    try:
+        from tools.build_personal_rag import retrieve_personal_context
+        items = retrieve_personal_context(question, top_k=8)
+        if items:
+            lines = "\n".join(f"- [{i.get('date','')}] {i['text'][:300]}" for i in items)
+            return f"\n\n## Specific things from your past conversations with him that may be relevant:\n{lines}"
     except Exception:
         pass
     return ""
@@ -690,25 +711,27 @@ def _build_system(name, config):
     return "\n\n".join(parts)
 
 
-def _opening_prompt(name, question, profile, kb):
+def _opening_prompt(name, question, profile, kb, anchor=""):
     kb_section = f"\n\n## Accumulated context (past decisions, learnings, patterns):\n{kb}" if kb else ""
-    return f"""## The person you are advising:
-{profile}{kb_section}{_rag_section(name, question)}
+    anchor_line = f"{anchor}\n\n" if anchor else ""
+    return f"""{anchor_line}## The person you are advising:
+{profile}{kb_section}{_rag_section(name, question)}{_personal_history_section(question)}
 
 ## Their question or situation:
 {question}"""
 
 
-async def _ask_advisor(name, config, messages, max_tokens=900):
-    content = await call_llm(
+async def _ask_advisor(name, config, messages, max_tokens=3600):
+    content, meta = await call_llm(
         messages, tier="heavy", max_tokens=max_tokens,
-        temperature=config.get("temperature", DEFAULT_TEMPERATURE)
+        temperature=config.get("temperature", DEFAULT_TEMPERATURE),
+        return_meta=True
     )
-    return name, config["role"], config["color"], content
+    return name, config["role"], config["color"], content, f"{meta['provider']}:{meta['model']}"
 
 
-async def _get_advisor_response(name, config, question, profile, kb=""):
-    prompt = _opening_prompt(name, question, profile, kb)
+async def _get_advisor_response(name, config, question, profile, kb="", anchor=""):
+    prompt = _opening_prompt(name, question, profile, kb, anchor=anchor)
     messages = [
         {"role": "system", "content": _build_system(name, config)},
         {"role": "user", "content": prompt},
@@ -717,10 +740,37 @@ async def _get_advisor_response(name, config, question, profile, kb=""):
     return result, prompt
 
 
+async def _stream_advisor_into_queue(queue, name, config, messages, max_tokens=3600):
+    """
+    Runs one advisor's streaming call and pushes ("token", name, delta) events
+    to the shared queue as they arrive, then ("done", name, (content, model))
+    when the stream completes. Multiple advisors run this concurrently; the
+    queue is what lets their tokens interleave into one SSE feed.
+    """
+    from llm import stream_llm
+    content = ""
+    model = None
+    try:
+        async for delta, meta in stream_llm(
+            messages, tier="heavy", max_tokens=max_tokens,
+            temperature=config.get("temperature", DEFAULT_TEMPERATURE)
+        ):
+            if delta:
+                content += delta
+                await queue.put(("token", name, delta))
+            if meta:
+                model = f"{meta['provider']}:{meta['model']}"
+                content = meta.get("text", content)
+    except Exception as e:
+        await queue.put(("error", name, str(e)))
+        return
+    await queue.put(("done", name, (content, model)))
+
+
 async def _get_synthesis(question, responses):
     board_text = "\n\n".join(
         f"**{name} ({role}):**\n{response}"
-        for name, role, _, response in responses
+        for name, role, _, response, _model in responses
     )
     prompt = f"""Board session for Hariv — 23-year-old Indian founder, automation agency, goal: vertical AI SaaS, NYC, billionaire.
 
@@ -739,7 +789,7 @@ Synthesize — under 250 words, 3 sections:
 
     return await call_llm(
         [{"role": "user", "content": prompt}],
-        tier="heavy", max_tokens=500, temperature=0.7
+        tier="heavy", max_tokens=2000, temperature=0.7
     )
 
 
@@ -783,8 +833,9 @@ def _others_context(session, advisor_name):
     return "[In this same board meeting, " + " | ".join(parts) + "]\n\n"
 
 
-def _followup_prompt(name, question, others_ctx=""):
-    return f"""{others_ctx}{_rag_section(name, question).lstrip()}Their follow-up:
+def _followup_prompt(name, question, others_ctx="", anchor=""):
+    anchor_line = f"{anchor}\n\n" if anchor else ""
+    return f"""{anchor_line}{others_ctx}{_rag_section(name, question).lstrip()}{_personal_history_section(question).lstrip()}Their follow-up:
 {question}"""
 
 
@@ -812,13 +863,22 @@ async def run_followup_async(session_id, question, target_advisor=None):
     prior_turns = session.get("turns", [])
     advisors_for_turn = [n for n in advisors_for_turn if n in BOARD]
 
+    anchor = ""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        import app as _app
+        anchor = _app._anchor_header()
+    except Exception:
+        pass
+
     # Each advisor continues their own real conversation thread: full persona,
     # full history as actual messages — no summaries, no truncation.
     prompts = {}
     tasks = []
     for name in advisors_for_turn:
         others = _others_context(session, name) if not target_advisor else ""
-        prompt = _followup_prompt(name, question, others)
+        prompt = _followup_prompt(name, question, others, anchor=anchor)
         prompts[name] = prompt
         messages = (
             [{"role": "system", "content": _build_system(name, BOARD[name])}]
@@ -835,8 +895,8 @@ async def run_followup_async(session_id, question, target_advisor=None):
 
     turn_num = len(prior_turns) + 1
     flat_responses = [
-        {"name": n, "role": r, "color": c, "response": resp}
-        for n, r, c, resp in responses
+        {"name": n, "role": r, "color": c, "response": resp, "model": model}
+        for n, r, c, resp, model in responses
     ]
     new_turn = {
         "turn": turn_num,
@@ -849,7 +909,7 @@ async def run_followup_async(session_id, question, target_advisor=None):
 
     # Persist the exact exchange into each advisor's thread
     threads = session.get("threads", {})
-    for n, _, _, resp in responses:
+    for n, _, _, resp, _model in responses:
         thread = threads.get(n) or _get_thread(session, n)
         thread.append({"role": "user", "content": prompts[n]})
         thread.append({"role": "assistant", "content": resp})
@@ -872,7 +932,7 @@ async def run_followup_async(session_id, question, target_advisor=None):
 
 
 async def _route_question(question):
-    """Pick 1-3 advisors and return brief reason for each pick."""
+    """Pick 1-4 advisors and return brief reason for each pick."""
     advisor_list = "\n".join(
         f"- {name}: {config['role']}"
         for name, config in BOARD.items()
@@ -882,7 +942,7 @@ async def _route_question(question):
 Advisors:
 {advisor_list}
 
-Pick exactly 1-3 advisors most relevant to this question. Return ONLY a JSON array of objects, no other text.
+Pick exactly 1-4 advisors most relevant to this question. Return ONLY a JSON array of objects, no other text.
 Each object: {{"name": "Full Name", "reason": "3-5 word reason"}}
 Example: [{{"name": "Charlie Munger", "reason": "decision biases, inversion"}}, {{"name": "Ray Dalio", "reason": "macro patterns, systems"}}]"""
 
@@ -891,17 +951,17 @@ Example: [{{"name": "Charlie Munger", "reason": "decision biases, inversion"}}, 
             [{"role": "user", "content": prompt}],
             tier="fast", max_tokens=120, temperature=0.1
         )
-        match = re.search(r'\[.*?\]', text, re.DOTALL)
+        match = re.search(r'\[.*\]', text, re.DOTALL)
         if match:
             parsed = json.loads(match.group())
             # Accept both old format (list of strings) and new format (list of dicts)
             if parsed and isinstance(parsed[0], str):
                 valid = [n for n in parsed if n in BOARD]
-                if 1 <= len(valid) <= 3:
+                if 1 <= len(valid) <= 4:
                     return [{"name": n, "reason": ""} for n in valid]
             elif parsed and isinstance(parsed[0], dict):
                 valid = [p for p in parsed if p.get("name") in BOARD]
-                if 1 <= len(valid) <= 3:
+                if 1 <= len(valid) <= 4:
                     return valid
     except Exception:
         pass
@@ -933,11 +993,15 @@ async def run_board_async(question):
 
     kb = load_knowledge_base()
 
-    # Inject live context from all modules so advisors know current reality
+    # Inject live context + deterministic anchor header so every session starts
+    # pinned to the scoreboard (MRR gap, NYC countdown, broken commitments) —
+    # not to whatever mood the question happened to be asked in.
+    anchor = ""
     try:
         import sys as _sys
         _sys.path.insert(0, str(Path(__file__).parent))
         import app as _app
+        anchor = _app._anchor_header()
         live_ctx = _app._build_live_context()
         if live_ctx:
             kb = (kb or "") + f"\n\n[LIVE CONTEXT — {datetime.now().strftime('%Y-%m-%d')}]\n{live_ctx}"
@@ -945,7 +1009,7 @@ async def run_board_async(question):
         pass
 
     tasks = [
-        _get_advisor_response(name, config, question, profile, kb)
+        _get_advisor_response(name, config, question, profile, kb, anchor=anchor)
         for name, config in selected_board.items()
     ]
     results = await asyncio.gather(*tasks)
@@ -958,15 +1022,24 @@ async def run_board_async(question):
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": content},
         ]
-        for (name, _role, _color, content), prompt in results
+        for (name, _role, _color, content, _model), prompt in results
     }
     session_id = save_session(question, responses, synthesis,
                                advisors=selected_names, advisor_reasons=advisor_reasons,
                                threads=threads)
 
-    asyncio.create_task(_update_knowledge_base(question, synthesis))
-    asyncio.create_task(_extract_recommendations(session_id, question, synthesis, selected_names))
-    asyncio.create_task(_update_advisor_memory(selected_names))
+    # Awaited (not fire-and-forget): run_board is invoked via asyncio.run(), which tears
+    # down the event loop the instant this coroutine returns, cancelling any pending
+    # create_task() before it finishes. That silently dropped recommendations/KB/memory
+    # updates. gather here so they complete before the loop closes.
+    await asyncio.gather(
+        _update_knowledge_base(question, synthesis),
+        _extract_recommendations(session_id, question, synthesis, selected_names),
+        _update_advisor_memory(selected_names),
+        _generate_session_title(session_id, question),
+        _index_personal_rag(),
+        return_exceptions=True,
+    )
 
     return {
         "session_id": session_id,
@@ -975,11 +1048,289 @@ async def run_board_async(question):
         "advisors": selected_names,
         "advisor_reasons": advisor_reasons,
         "responses": [
-            {"name": n, "role": r, "color": c, "response": resp}
-            for n, r, c, resp in responses
+            {"name": n, "role": r, "color": c, "response": resp, "model": model}
+            for n, r, c, resp, model in responses
         ],
         "synthesis": synthesis
     }
+
+
+async def run_board_stream(question):
+    """
+    Async generator version of run_board_async. Yields dicts ready to be
+    SSE-encoded by app.py:
+      {"event": "routing", "advisors": [...], "reasons": {...}}
+      {"event": "advisor_token", "advisor": name, "delta": text}
+      {"event": "advisor_done", "advisor": name, "content": text, "model": model}
+      {"event": "synthesis_token", "delta": text}
+      {"event": "done", "session_id": id, "synthesis": text}
+      {"event": "error", "message": text}
+    """
+    if not _has_llm_key():
+        yield {"event": "error", "message": "No LLM API key set (OPENROUTER_API_KEY / GROQ_API_KEY) in .env"}
+        return
+
+    profile = load_profile()
+    routed = await _route_question(question)
+    selected_names = [r["name"] for r in routed]
+    advisor_reasons = {r["name"]: r["reason"] for r in routed}
+    selected_board = {name: BOARD[name] for name in selected_names if name in BOARD}
+
+    yield {"event": "routing", "advisors": selected_names, "reasons": advisor_reasons}
+
+    kb = load_knowledge_base()
+    anchor = ""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        import app as _app
+        anchor = _app._anchor_header()
+        live_ctx = _app._build_live_context()
+        if live_ctx:
+            kb = (kb or "") + f"\n\n[LIVE CONTEXT — {datetime.now().strftime('%Y-%m-%d')}]\n{live_ctx}"
+    except Exception:
+        pass
+
+    prompts = {}
+    queue = asyncio.Queue()
+    tasks = []
+    for name, config in selected_board.items():
+        prompt = _opening_prompt(name, question, profile, kb, anchor=anchor)
+        prompts[name] = prompt
+        messages = [
+            {"role": "system", "content": _build_system(name, config)},
+            {"role": "user", "content": prompt},
+        ]
+        tasks.append(asyncio.create_task(_stream_advisor_into_queue(queue, name, config, messages)))
+
+    results = {}
+    remaining = len(tasks)
+    while remaining > 0:
+        kind, name, payload = await queue.get()
+        if kind == "token":
+            yield {"event": "advisor_token", "advisor": name, "delta": payload}
+        elif kind == "error":
+            remaining -= 1
+            results[name] = ("", f"error:{payload}")
+            yield {"event": "error", "message": f"{name}: {payload}"}
+        elif kind == "done":
+            remaining -= 1
+            content, model = payload
+            results[name] = (content, model)
+            yield {"event": "advisor_done", "advisor": name, "content": content, "model": model}
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    responses = [
+        (name, selected_board[name]["role"], selected_board[name]["color"], content, model)
+        for name, (content, model) in results.items()
+        if content
+    ]
+
+    synthesis = ""
+    if responses:
+        # Uses the non-streaming call_llm path deliberately: it has proven,
+        # reliable reasoning-exclusion + <think>-stripping. The streaming path's
+        # exclusion isn't as consistently honored by free reasoning models, and
+        # synthesis is one short call per session — not worth the risk of a
+        # leaked "the user wants me to..." reasoning trace reaching the UI.
+        try:
+            synthesis = await _get_synthesis(question, responses)
+            yield {"event": "synthesis_token", "delta": synthesis}
+        except Exception:
+            pass
+
+    threads = {
+        name: [{"role": "user", "content": prompts[name]}, {"role": "assistant", "content": content}]
+        for name, (content, _model) in results.items() if content
+    }
+    session_id = save_session(question, responses, synthesis,
+                               advisors=selected_names, advisor_reasons=advisor_reasons,
+                               threads=threads)
+
+    # Awaited before the generator ends — app.py's _run_stream_generator closes its event
+    # loop right after this generator's StopAsyncIteration, which would cancel any pending
+    # fire-and-forget create_task() the same way the non-streaming path did (see run_board_async).
+    await asyncio.gather(
+        _update_knowledge_base(question, synthesis),
+        _extract_recommendations(session_id, question, synthesis, selected_names),
+        _update_advisor_memory(selected_names),
+        _generate_session_title(session_id, question),
+        _index_personal_rag(),
+        return_exceptions=True,
+    )
+
+    yield {"event": "done", "session_id": session_id, "synthesis": synthesis}
+
+
+async def run_followup_stream(session_id, question, target_advisor=None, max_tokens=3600):
+    """Streaming version of run_followup_async. Same event shape as run_board_stream."""
+    if not _has_llm_key():
+        yield {"event": "error", "message": "No LLM API key set"}
+        return
+
+    session = get_session(session_id)
+    if not session:
+        yield {"event": "error", "message": f"Session {session_id} not found"}
+        return
+
+    locked = session.get("advisors") or [r["name"] for r in session.get("responses", [])]
+    if target_advisor:
+        if target_advisor not in BOARD:
+            yield {"event": "error", "message": f"Unknown advisor: {target_advisor}"}
+            return
+        advisors_for_turn = [target_advisor]
+    else:
+        advisors_for_turn = locked
+    advisors_for_turn = [n for n in advisors_for_turn if n in BOARD]
+
+    yield {"event": "routing", "advisors": advisors_for_turn, "reasons": {}}
+
+    anchor = ""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        import app as _app
+        anchor = _app._anchor_header()
+    except Exception:
+        pass
+
+    prior_turns = session.get("turns", [])
+    prompts = {}
+    queue = asyncio.Queue()
+    tasks = []
+    for name in advisors_for_turn:
+        others = _others_context(session, name) if not target_advisor else ""
+        prompt = _followup_prompt(name, question, others, anchor=anchor)
+        prompts[name] = prompt
+        messages = (
+            [{"role": "system", "content": _build_system(name, BOARD[name])}]
+            + _get_thread(session, name)
+            + [{"role": "user", "content": prompt}]
+        )
+        tasks.append(asyncio.create_task(_stream_advisor_into_queue(queue, name, BOARD[name], messages, max_tokens=max_tokens)))
+
+    results = {}
+    remaining = len(tasks)
+    while remaining > 0:
+        kind, name, payload = await queue.get()
+        if kind == "token":
+            yield {"event": "advisor_token", "advisor": name, "delta": payload}
+        elif kind == "error":
+            remaining -= 1
+            results[name] = ("", f"error:{payload}")
+            yield {"event": "error", "message": f"{name}: {payload}"}
+        elif kind == "done":
+            remaining -= 1
+            content, model = payload
+            results[name] = (content, model)
+            yield {"event": "advisor_done", "advisor": name, "content": content, "model": model}
+
+    await asyncio.gather(*tasks, return_exceptions=True)
+
+    responses = [
+        (name, BOARD[name]["role"], BOARD[name]["color"], content, model)
+        for name, (content, model) in results.items()
+        if content
+    ]
+
+    synthesis = None
+    if target_advisor is None and len(responses) > 1:
+        synthesis = await _get_synthesis(question, responses)
+        if synthesis:
+            yield {"event": "synthesis_token", "delta": synthesis}
+
+    turn_num = len(prior_turns) + 1
+    flat_responses = [
+        {"name": n, "role": r, "color": c, "response": resp, "model": model}
+        for n, r, c, resp, model in responses
+    ]
+    new_turn = {
+        "turn": turn_num, "timestamp": datetime.now().isoformat(), "question": question,
+        "target_advisor": target_advisor, "responses": flat_responses, "synthesis": synthesis,
+    }
+
+    threads = session.get("threads", {})
+    for n, (content, _model) in results.items():
+        if not content:
+            continue
+        thread = threads.get(n) or _get_thread(session, n)
+        thread.append({"role": "user", "content": prompts[n]})
+        thread.append({"role": "assistant", "content": content})
+        threads[n] = thread
+    session["threads"] = threads
+    session["schema_version"] = 3
+    prior_turns.append(new_turn)
+    session["turns"] = prior_turns
+    session["responses"] = flat_responses
+    if synthesis:
+        session["synthesis"] = synthesis
+    (SESSIONS_DIR / f"{session_id}.json").write_text(json.dumps(session, indent=2))
+
+    yield {"event": "done", "session_id": session_id, "turn_number": turn_num}
+
+
+async def _index_personal_rag():
+    """Incrementally embed new session/log/decision data into the personal-history RAG."""
+    try:
+        from tools.build_personal_rag import build_incremental
+        await asyncio.get_event_loop().run_in_executor(None, build_incremental)
+    except Exception:
+        pass
+
+
+async def _generate_session_title(session_id, question):
+    """One-line title per session so History shows something scannable
+    instead of a truncated raw question."""
+    try:
+        title = await call_llm(
+            [{"role": "user", "content": f'Write a 4-7 word title for a board-of-advisors session about this question: "{question}"\nNo quotes, no punctuation at the end, just the title.'}],
+            tier="fast", max_tokens=20, temperature=0.3
+        )
+        title = title.strip().strip('"').strip("'")
+        path = SESSIONS_DIR / f"{session_id}.json"
+        if path.exists():
+            session = json.loads(path.read_text())
+            session["title"] = title
+            path.write_text(json.dumps(session, indent=2))
+    except Exception:
+        pass
+
+
+async def consolidate_knowledge_base():
+    """
+    Monthly job: rewrite knowledge_base.md, merging duplicates and dropping
+    stale/low-signal items so the always-injected KB stays under ~4k chars
+    of high-signal content instead of growing forever. Callable directly
+    (cron hits an app.py route that calls this).
+    """
+    if not KB_PATH.exists():
+        return
+    existing = KB_PATH.read_text()
+    if len(existing) < 3000:
+        return  # not worth consolidating yet
+    prompt = f"""This is a running knowledge base of learnings from board-advisory sessions with a founder. It has grown large and needs consolidation.
+
+{existing[:8000]}
+
+Rewrite this into a consolidated version under 3500 characters:
+- Merge duplicate or near-duplicate insights into one bullet
+- Drop stale items that are clearly outdated or superseded by later entries
+- Keep the most specific, evidence-based insights; drop generic advice
+- Preserve the "# Knowledge Base" header and "## Board Session Learnings" section structure
+- Keep dates on bullets you retain
+
+Return only the consolidated markdown, nothing else."""
+    try:
+        consolidated = await call_llm(
+            [{"role": "user", "content": prompt}],
+            tier="heavy", max_tokens=4800, temperature=0.2
+        )
+        consolidated = consolidated.strip()
+        if consolidated and "# Knowledge Base" in consolidated:
+            KB_PATH.write_text(consolidated)
+    except Exception:
+        pass
 
 
 async def _update_knowledge_base(question, synthesis):
@@ -1017,6 +1368,23 @@ Max 3 bullets. Be specific, not generic."""
         pass
 
 
+def _timeframe_to_deadline(timeframe, from_date=None):
+    """Turn an informal timeframe ('today'/'this week'/'this month') into a
+    concrete deadline date so the commitment scoreboard has something real to
+    check pending recs against."""
+    from_date = from_date or datetime.now().date()
+    tf = (timeframe or "").lower()
+    if "today" in tf:
+        days = 1
+    elif "week" in tf:
+        days = 7
+    elif "month" in tf:
+        days = 30
+    else:
+        days = 7
+    return (from_date + timedelta(days=days)).isoformat()
+
+
 async def _extract_recommendations(session_id, question, synthesis, advisors):
     """Pull 1-2 specific actionable recommendations out of every board synthesis."""
     prompt = f"""A board of advisors ({", ".join(advisors)}) just answered this question:
@@ -1050,13 +1418,15 @@ No explanation, just JSON."""
 
         existing = _load_recs()
         for r in recs_data[:2]:
+            timeframe = r.get("timeframe", "this week")
             existing.append({
                 "id": datetime.now().strftime("%Y%m%d%H%M%S") + str(len(existing)),
                 "date": datetime.now().strftime("%Y-%m-%d"),
                 "session_id": session_id,
                 "advisor": r.get("advisor", "Board"),
                 "recommendation": r.get("recommendation", ""),
-                "timeframe": r.get("timeframe", "this week"),
+                "timeframe": timeframe,
+                "deadline": _timeframe_to_deadline(timeframe),
                 "status": "pending",
                 "actioned_date": None
             })

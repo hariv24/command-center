@@ -5,6 +5,7 @@ Auto-runs at 5am IST via cron. Covers: breaking, hottest, viral, controversial, 
 
 import asyncio
 import os
+import re
 import sys
 import json
 import html
@@ -17,6 +18,22 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from llm import call_llm
 
 load_dotenv(Path(__file__).parent.parent / ".env")
+
+
+def _fix_markdown_headers(text):
+    """
+    Deterministic cleanup, not left to LLM compliance: CommonMark requires a
+    space after '#'/'##' for it to render as a header at all — without it,
+    browsers show the literal '##text' instead of an <h2>. The model
+    occasionally drops the space (especially right after inserting a bracketed
+    tag like '##[HOTTEST]'), so we enforce it here rather than hoping every
+    generation gets the template exactly right.
+    """
+    # Capture the hash run together with the first following char, requiring
+    # that char to be neither '#' nor whitespace — this is what prevents the
+    # regex from backtracking into an already-correctly-spaced header (e.g.
+    # matching just one '#' of "## text" and inserting a bogus extra space).
+    return re.sub(r"^(#+)([^#\s])", r"\1 \2", text, flags=re.MULTILINE)
 
 PROFILE_PATH = Path(__file__).parent.parent / "profile.md"
 
@@ -164,12 +181,46 @@ def is_relevant(title, text=""):
     return is_ai_tech(title, text) or is_startup_biz(title, text)
 
 
-def select_diverse_stories(all_stories):
+def build_goal_keywords(goals, pipeline=None):
+    """
+    Words worth boosting in story selection because they're what Hariv is actually
+    working toward right now — not just generic AI/startup topic matches.
+    """
+    words = set()
+    for g in goals or []:
+        if g.get("status") != "active":
+            continue
+        for field in (g.get("title", ""), g.get("why", ""), g.get("category", "")):
+            for w in re.split(r"\W+", field.lower()):
+                if len(w) > 3:
+                    words.add(w)
+    for p in pipeline or []:
+        for field in (p.get("name", ""), p.get("source", "")):
+            for w in re.split(r"\W+", field.lower()):
+                if len(w) > 3:
+                    words.add(w)
+    # Generic filler words that end up long enough to pass the len>3 filter but
+    # carry no real signal — drop them so they don't falsely "match" every story.
+    words -= {"active", "target", "before", "every", "which", "there", "month", "year", "with"}
+    return words
+
+
+def is_goal_match(title, text, goal_keywords):
+    if not goal_keywords:
+        return False
+    combined = (title + " " + text).lower()
+    return any(w in combined for w in goal_keywords)
+
+
+def select_diverse_stories(all_stories, goal_keywords=None):
     """
     Pick 7 stories across different angles: hottest, viral, controversial,
     breaking, AI/tech, startup/biz, wildcard.
     Each slot gets a distinct story — no duplicates.
     Falls back to any unseen story if the preferred pool is exhausted.
+    AI & TECH and STARTUP & BUSINESS are additionally boosted toward stories
+    that match Hariv's active goals/pipeline, not just generic topic keywords —
+    so intel actually tracks what he's working on, not just what's trending.
     """
     relevant = [s for s in all_stories if is_relevant(s["title"], s.get("selftext", ""))]
     irrelevant = [s for s in all_stories if not is_relevant(s["title"], s.get("selftext", ""))]
@@ -177,6 +228,7 @@ def select_diverse_stories(all_stories):
 
     seen_ids = set()
     selected = {}
+    goal_matched_keys = set()
 
     def pick(pool, key, fallback=None):
         """Pick first unseen story from pool, falling back to fallback pool, then any story."""
@@ -206,21 +258,31 @@ def select_diverse_stories(all_stories):
     breaking_pool = [s for s in by_time if is_relevant(s["title"], s.get("selftext", ""))]
     pick(breaking_pool or by_time, "BREAKING", fallback=by_time)
 
-    # AI & TECH — top scored AI/tech story
-    ai_pool = sorted([s for s in all_stories if is_ai_tech(s["title"], s.get("selftext", ""))],
-                     key=lambda x: x["score"], reverse=True)
-    pick(ai_pool, "AI & TECH", fallback=all_by_score)
+    # AI & TECH — top scored AI/tech story, goal-matching stories boosted to the front
+    ai_pool = sorted(
+        [s for s in all_stories if is_ai_tech(s["title"], s.get("selftext", ""))],
+        key=lambda x: (is_goal_match(x["title"], x.get("selftext", ""), goal_keywords), x["score"]),
+        reverse=True,
+    )
+    picked = pick(ai_pool, "AI & TECH", fallback=all_by_score)
+    if picked and is_goal_match(picked["title"], picked.get("selftext", ""), goal_keywords):
+        goal_matched_keys.add("AI & TECH")
 
-    # STARTUP & BUSINESS — top scored startup/biz story
-    biz_pool = sorted([s for s in all_stories if is_startup_biz(s["title"], s.get("selftext", ""))],
-                      key=lambda x: x["score"], reverse=True)
-    pick(biz_pool, "STARTUP & BUSINESS", fallback=all_by_score)
+    # STARTUP & BUSINESS — top scored startup/biz story, same goal boost
+    biz_pool = sorted(
+        [s for s in all_stories if is_startup_biz(s["title"], s.get("selftext", ""))],
+        key=lambda x: (is_goal_match(x["title"], x.get("selftext", ""), goal_keywords), x["score"]),
+        reverse=True,
+    )
+    picked = pick(biz_pool, "STARTUP & BUSINESS", fallback=all_by_score)
+    if picked and is_goal_match(picked["title"], picked.get("selftext", ""), goal_keywords):
+        goal_matched_keys.add("STARTUP & BUSINESS")
 
     # WILDCARD — outside AI/startup world
     wild_pool = sorted(irrelevant, key=lambda x: x["score"], reverse=True)
     pick(wild_pool, "WILDCARD", fallback=all_by_score)
 
-    return selected  # dict: category -> story
+    return selected, goal_matched_keys  # dict: category -> story, set of categories picked for goal relevance
 
 
 def format_story_for_prompt(story, category, desc):
@@ -239,13 +301,18 @@ def format_story_for_prompt(story, category, desc):
     return "\n".join(lines)
 
 
-async def analyze_story(story, category, category_desc, story_idx, profile=""):
+async def analyze_story(story, category, category_desc, story_idx, profile="", goal_match=False):
     story_text = format_story_for_prompt(story, category, category_desc)
     profile_ctx = profile[:400] if profile else "An ambitious founder building toward a big goal."
+    goal_note = (
+        "\nThis story was surfaced specifically because it matches one of the founder's active goals "
+        "or open pipeline deals — make the 'Direct implications' section concrete about which goal/deal "
+        "it touches and what to do about it, not generic.\n" if goal_match else ""
+    )
 
     prompt = f"""You are briefing a founder with this profile:
 {profile_ctx}
-
+{goal_note}
 TODAY'S STORY — CATEGORY: {category} ({category_desc})
 
 {story_text}
@@ -274,7 +341,10 @@ Write a long-form intelligence brief section. Structure:
 
 Make this comprehensive. A reader should fully understand this story and its implications from this section alone. Do not summarize. Explain."""
 
-    return await call_llm([{"role": "user", "content": prompt}], tier="heavy", max_tokens=1000, temperature=0.7)
+    # This runs in a background thread nobody's watching live — favor letting a
+    # slow-but-successful large generation finish over failing fast (unlike the
+    # interactive board, which needs the tighter default timeout).
+    return await call_llm([{"role": "user", "content": prompt}], tier="heavy", max_tokens=4000, temperature=0.7, timeout=300)
 
 
 async def generate_board_verdict(story_map, profile):
@@ -297,7 +367,7 @@ Write a "Board's Verdict" — as if Elon Musk, Jeff Bezos, Warren Buffett, Steve
 
 Be direct. Be specific. Write as if their future depends on this."""
 
-    return await call_llm([{"role": "user", "content": prompt}], tier="heavy", max_tokens=600, temperature=0.7)
+    return await call_llm([{"role": "user", "content": prompt}], tier="heavy", max_tokens=2400, temperature=0.7, timeout=300)
 
 
 async def run_daily_brief_async():
@@ -306,8 +376,10 @@ async def run_daily_brief_async():
 
     profile = PROFILE_PATH.read_text() if PROFILE_PATH.exists() else ""
 
-    # Load active goals to make intel analysis goal-aware
+    # Load active goals + open pipeline to make intel analysis goal-aware
     goals_file = Path(__file__).parent.parent / "data" / "goals.json"
+    pipeline_file = Path(__file__).parent.parent / "data" / "pipeline.json"
+    goals, pipeline = [], []
     goals_ctx = ""
     if goals_file.exists():
         try:
@@ -320,6 +392,12 @@ async def run_daily_brief_async():
                 )
         except Exception:
             pass
+    if pipeline_file.exists():
+        try:
+            pipeline = json.loads(pipeline_file.read_text())
+        except Exception:
+            pass
+    goal_keywords = build_goal_keywords(goals, pipeline)
 
     print("  Fetching HN stories + comments...")
     hn_stories = fetch_hn_stories(80)
@@ -341,17 +419,20 @@ async def run_daily_brief_async():
             deduped.append(s)
 
     print(f"  Selecting 7 stories across categories from {len(deduped)} total...")
-    story_map = select_diverse_stories(deduped)
+    story_map, goal_matched_keys = select_diverse_stories(deduped, goal_keywords=goal_keywords)
 
     if not story_map:
         return "No stories found today. Sources may be down. Try again in a few hours."
+
+    if goal_matched_keys:
+        print(f"  Goal-matched categories: {', '.join(goal_matched_keys)}")
 
     print(f"  Analyzing {len(story_map)} stories in parallel...")
 
     full_profile = (profile + ("\n\n" + goals_ctx if goals_ctx else "")).strip()
 
     analysis_tasks = [
-        analyze_story(story, cat, CATEGORIES[cat], idx + 1, full_profile)
+        analyze_story(story, cat, CATEGORIES[cat], idx + 1, full_profile, goal_match=cat in goal_matched_keys)
         for idx, (cat, story) in enumerate(story_map.items())
     ]
     analyses = await asyncio.gather(*analysis_tasks)
@@ -375,7 +456,7 @@ async def run_daily_brief_async():
         board_verdict
     ])
 
-    full_brief = "\n\n".join(sections)
+    full_brief = _fix_markdown_headers("\n\n".join(sections))
 
     briefs_dir = Path(__file__).parent.parent / "briefs"
     briefs_dir.mkdir(exist_ok=True)

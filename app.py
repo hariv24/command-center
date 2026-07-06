@@ -6,19 +6,20 @@ Open: http://localhost:4000
 
 import asyncio
 import json
+import re
 import sys
 import os
 import uuid
 from pathlib import Path
 from datetime import datetime
-from flask import Flask, render_template, request, jsonify, session as flask_session, redirect, url_for
+from flask import Flask, render_template, request, jsonify, session as flask_session, redirect, url_for, Response
 from functools import wraps
 from dotenv import load_dotenv
 
 load_dotenv(Path(__file__).parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent))
-from board import run_board, list_sessions, get_session, get_quick_response, _load_recs, _save_recs, run_followup_async
+from board import run_board, list_sessions, get_session, get_quick_response, _load_recs, _save_recs, run_followup_async, run_board_stream, run_followup_stream
 from llm import call_llm
 from tools.daily_brief import run_daily_brief_async
 
@@ -47,6 +48,36 @@ def requires_auth(f):
             return redirect(url_for("login"))
         return f(*args, **kwargs)
     return decorated
+
+
+def requires_localhost(f):
+    """Cron endpoints are triggered by crontab curl on the same machine, not by a logged-in
+    session — protect them by origin instead of auth so systemd/cron can still reach them."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if request.remote_addr not in ("127.0.0.1", "::1"):
+            return jsonify({"error": "forbidden"}), 403
+        return f(*args, **kwargs)
+    return decorated
+
+
+@app.route("/healthz")
+def healthz():
+    """No-auth health check for uptime monitoring and post-deploy verification."""
+    from pathlib import Path as _Path
+    checks = {
+        "openrouter_key": bool(os.getenv("OPENROUTER_API_KEY")),
+        "groq_key": bool(os.getenv("GROQ_API_KEY")),
+        "chroma_db": (_Path(__file__).parent / "chroma_db").exists(),
+        "last_brief": None,
+    }
+    try:
+        briefs = sorted(BRIEFS_DIR.glob("[0-9]*.md"), reverse=True)
+        checks["last_brief"] = briefs[0].stem if briefs else None
+    except Exception:
+        pass
+    healthy = checks["openrouter_key"] or checks["groq_key"]
+    return jsonify({"status": "ok" if healthy else "degraded", **checks}), (200 if healthy else 503)
 
 
 @app.route("/login", methods=["GET", "POST"])
@@ -116,10 +147,15 @@ def _build_live_context(include_goals=True, include_decisions=True,
             parts.append("ACTIVE GOALS:\n" + "\n".join(lines))
 
     if include_decisions:
-        decs = [d for d in load_json(DECISIONS_FILE) if not d.get("outcome")]
+        all_decs = load_json(DECISIONS_FILE)
+        decs = [d for d in all_decs if not d.get("outcome")]
         if decs:
             lines = [f"- \"{d.get('decision','')[:100]}\" (logged {d.get('date','')})" for d in decs[-5:]]
             parts.append("OPEN DECISIONS (unresolved):\n" + "\n".join(lines))
+        due = [d for d in all_decs if not d.get("outcome") and d.get("review_date") and d["review_date"] <= today.isoformat()]
+        if due:
+            lines = [f"- \"{d.get('decision','')[:100]}\" was due for review on {d['review_date']} — what happened?" for d in due[:3]]
+            parts.append("DECISIONS DUE FOR REVIEW:\n" + "\n".join(lines))
 
     if include_logs:
         logs = load_json(DAILY_LOG_FILE)
@@ -172,9 +208,93 @@ def _build_live_context(include_goals=True, include_decisions=True,
         summary = " · ".join(f"{k}: {v:.1f}h" for k, v in sorted(by_cat.items(), key=lambda x: -x[1]))
         parts.append(f"TIME THIS WEEK: {summary}")
 
+    # Pipeline & MRR gap — the deterministic numbers the board must reason from
+    import gap_engine
+    pipeline = load_json(PIPELINE_FILE) if PIPELINE_FILE.exists() else []
+    if pipeline:
+        goals = load_json(GOALS_FILE)
+        mrr_goal = next((g for g in goals if g.get("id") == "mrr-50k"), None)
+        target = 50000
+        deadline = mrr_goal.get("deadline") if mrr_goal else None
+        if mrr_goal:
+            try:
+                target = float(str(mrr_goal.get("target", "50000")).replace(",", ""))
+            except ValueError:
+                pass
+        gap = gap_engine.compute_mrr_gap(pipeline, target=target, deadline_iso=deadline)
+        open_deals = [p for p in pipeline if p.get("stage") in ("contacted", "demo", "proposal")]
+        lines = [
+            f"Current MRR: ₹{gap['current_mrr']:,.0f} / ₹{gap['target']:,.0f} target — gap ₹{gap['gap']:,.0f}",
+        ]
+        if gap["months_left"] is not None:
+            lines.append(f"{gap['months_left']} months left; needs ₹{gap['required_new_mrr_per_month']:,.0f}/month new MRR")
+        if open_deals:
+            lines.append(
+                "Open pipeline: " + "; ".join(
+                    f"{p['name']} (₹{p.get('mrr_value',0):,.0f}/mo, {p['stage']})" for p in open_deals[:5]
+                )
+            )
+        parts.append("PIPELINE & MRR GAP:\n" + "\n".join(lines))
+
+    # Commitment scoreboard — recommendations he accepted and either kept or broke
+    recs_all = load_json(RECS_FILE) if RECS_FILE.exists() else []
+    if recs_all:
+        scoreboard = gap_engine.compute_commitment_scoreboard(recs_all)
+        if scoreboard["broken"] > 0:
+            lines = [f"Kept {scoreboard['kept']} / Broken {scoreboard['broken']} (ratio {scoreboard['kept_ratio_pct']}%)"]
+            for item in scoreboard["broken_items"][:3]:
+                lines.append(f"- BROKEN: \"{item.get('recommendation','')[:100]}\" (due {item.get('deadline') or item.get('date','')})")
+            parts.append("COMMITMENT SCOREBOARD (advisors should confront broken ones directly):\n" + "\n".join(lines))
+
     if not parts:
         return ""
     return "\n\n".join(parts)
+
+
+def _anchor_header():
+    """
+    Deterministic 3-4 line state block — prepended to every board/coach prompt
+    so conversations start anchored to the scoreboard, not to the mood of the
+    question. Cheap (no LLM call), always current.
+    """
+    import gap_engine
+    from datetime import date
+    today = date.today()
+    pipeline = load_json(PIPELINE_FILE) if PIPELINE_FILE.exists() else []
+    goals = load_json(GOALS_FILE)
+    lines = []
+
+    mrr_goal = next((g for g in goals if g.get("id") == "mrr-50k"), None)
+    if pipeline or mrr_goal:
+        target = 50000
+        deadline = mrr_goal.get("deadline") if mrr_goal else None
+        if mrr_goal:
+            try:
+                target = float(str(mrr_goal.get("target", "50000")).replace(",", ""))
+            except ValueError:
+                pass
+        gap = gap_engine.compute_mrr_gap(pipeline, target=target, deadline_iso=deadline)
+        line = f"MRR: ₹{gap['current_mrr']:,.0f}/₹{gap['target']:,.0f}"
+        if gap["months_left"] is not None:
+            line += f" ({gap['months_left']}mo left)"
+        lines.append(line)
+
+    nyc_days = (date.fromisoformat("2028-01-01") - today).days
+    lines.append(f"NYC: {nyc_days}d left")
+
+    active_goals = [g for g in goals if g.get("status") == "active"]
+    if active_goals:
+        lines.append(f"Top goal: {active_goals[0]['title']}")
+
+    recs_all = load_json(RECS_FILE) if RECS_FILE.exists() else []
+    if recs_all:
+        scoreboard = gap_engine.compute_commitment_scoreboard(recs_all)
+        if scoreboard["broken"] > 0:
+            lines.append(f"Broken commitments: {scoreboard['broken']}")
+
+    if not lines:
+        return ""
+    return "[STATE: " + " · ".join(lines) + "]"
 
 # Hariv's immutable north star — calibrated to his actual stated goals
 NORTH_STAR = {
@@ -227,6 +347,7 @@ def index():
 
 
 @app.route("/api/board", methods=["POST"])
+@requires_auth
 def board():
     data = request.get_json()
     question = data.get("question", "").strip()
@@ -259,7 +380,67 @@ def board_followup(session_id):
         return jsonify({"error": _friendly_error(e)}), 500
 
 
+def _sse_encode(event_dict):
+    return f"data: {json.dumps(event_dict)}\n\n"
+
+
+def _run_stream_generator(async_gen_factory):
+    """
+    Bridges an async generator (board.py's run_board_stream/run_followup_stream)
+    into a sync generator Flask can stream as SSE, using a dedicated event loop
+    running in this request's thread.
+    """
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    agen = async_gen_factory()
+    try:
+        while True:
+            try:
+                item = loop.run_until_complete(agen.__anext__())
+            except StopAsyncIteration:
+                break
+            yield _sse_encode(item)
+    finally:
+        loop.close()
+
+
+@app.route("/api/board/stream", methods=["POST"])
+@requires_auth
+def board_stream():
+    data = request.get_json()
+    question = data.get("question", "").strip()
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+    wb = load_json(WELLNESS_BRIEF_FILE) if WELLNESS_BRIEF_FILE.exists() else {}
+    wellness_append = f"\n\nHariv's current wellness state: {wb['content']}" if wb.get("content") else ""
+    full_question = question + wellness_append if wellness_append else question
+
+    def factory():
+        return run_board_stream(full_question)
+
+    return Response(_run_stream_generator(factory), mimetype="text/event-stream",
+                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/board/<session_id>/followup/stream", methods=["POST"])
+@requires_auth
+def board_followup_stream(session_id):
+    data = request.get_json()
+    question = data.get("question", "").strip()
+    target_advisor = data.get("advisor") or None
+    max_tokens = int(data.get("max_tokens", 900))
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+
+    def factory():
+        return run_followup_stream(session_id, question, target_advisor, max_tokens=max_tokens)
+
+    return Response(_run_stream_generator(factory), mimetype="text/event-stream",
+                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
 @app.route("/api/board/quick", methods=["POST"])
+@requires_auth
 def quick_board():
     data = request.get_json()
     question = data.get("question", "").strip()
@@ -273,12 +454,14 @@ def quick_board():
 
 
 @app.route("/api/recommendations", methods=["GET"])
+@requires_auth
 def get_recommendations():
     recs = _load_recs()
     return jsonify(sorted(recs, key=lambda r: r.get("date",""), reverse=True))
 
 
 @app.route("/api/recommendations/<rec_id>", methods=["PUT"])
+@requires_auth
 def update_recommendation(rec_id):
     recs = _load_recs()
     d = request.get_json()
@@ -293,6 +476,7 @@ def update_recommendation(rec_id):
 
 
 @app.route("/api/brief", methods=["POST"])
+@requires_auth
 def brief():
     from datetime import date
     import threading
@@ -312,6 +496,7 @@ def brief():
 
 
 @app.route("/api/brief/poll", methods=["GET"])
+@requires_auth
 def brief_poll():
     from datetime import date
     today = date.today().strftime("%Y-%m-%d")
@@ -322,6 +507,7 @@ def brief_poll():
 
 
 @app.route("/api/briefs", methods=["GET"])
+@requires_auth
 def list_briefs():
     import re
     briefs = []
@@ -332,6 +518,7 @@ def list_briefs():
 
 
 @app.route("/api/briefs/<date>", methods=["GET"])
+@requires_auth
 def get_brief(date):
     path = BRIEFS_DIR / f"{date}.md"
     if not path.exists():
@@ -340,11 +527,13 @@ def get_brief(date):
 
 
 @app.route("/api/sessions", methods=["GET"])
+@requires_auth
 def sessions():
     return jsonify(list_sessions())
 
 
 @app.route("/api/sessions/<session_id>", methods=["GET"])
+@requires_auth
 def session(session_id):
     data = get_session(session_id)
     if not data:
@@ -354,11 +543,13 @@ def session(session_id):
 
 # ── Finance tracking ──────────────────────────────────────────
 @app.route("/api/expenses", methods=["GET"])
+@requires_auth
 def get_expenses():
     return jsonify(load_json(EXPENSES_FILE))
 
 
 @app.route("/api/expenses", methods=["POST"])
+@requires_auth
 def add_expense():
     d = request.get_json()
     if not d.get("amount") or not d.get("category"):
@@ -378,6 +569,7 @@ def add_expense():
 
 
 @app.route("/api/expenses/<expense_id>", methods=["DELETE"])
+@requires_auth
 def delete_expense(expense_id):
     expenses = load_json(EXPENSES_FILE)
     expenses = [e for e in expenses if e["id"] != expense_id]
@@ -386,6 +578,7 @@ def delete_expense(expense_id):
 
 
 @app.route("/api/expenses/summary", methods=["GET"])
+@requires_auth
 def expense_summary():
     expenses = load_json(EXPENSES_FILE)
     month = request.args.get("month", datetime.now().strftime("%Y-%m"))
@@ -405,11 +598,13 @@ def expense_summary():
 
 # ── Time tracking ──────────────────────────────────────────────
 @app.route("/api/time", methods=["GET"])
+@requires_auth
 def get_time_logs():
     return jsonify(load_json(TIME_FILE))
 
 
 @app.route("/api/time", methods=["POST"])
+@requires_auth
 def add_time_log():
     d = request.get_json()
     if not d.get("hours") or not d.get("category"):
@@ -429,6 +624,7 @@ def add_time_log():
 
 
 @app.route("/api/time/<log_id>", methods=["DELETE"])
+@requires_auth
 def delete_time_log(log_id):
     logs = load_json(TIME_FILE)
     logs = [l for l in logs if l["id"] != log_id]
@@ -437,6 +633,7 @@ def delete_time_log(log_id):
 
 
 @app.route("/api/time/summary", methods=["GET"])
+@requires_auth
 def time_summary():
     logs = load_json(TIME_FILE)
     week = request.args.get("week")
@@ -468,6 +665,7 @@ def time_summary():
 
 # ── Natural language time logging ─────────────────────────────
 @app.route("/api/time/parse", methods=["POST"])
+@requires_auth
 def parse_time_natural():
     """Parse a natural language daily summary into structured time log entries."""
     import asyncio as _asyncio
@@ -498,7 +696,7 @@ Example output: [{{"category": "Agency Work", "hours": 3, "task": "Shakti ERP in
 
     try:
         raw = _asyncio.run(_parse())
-        match = re.search(r'\[.*?\]', raw, re.DOTALL)
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
         if not match:
             return jsonify({"error": "Could not parse", "raw": raw}), 400
 
@@ -524,6 +722,7 @@ Example output: [{{"category": "Agency Work", "hours": 3, "task": "Shakti ERP in
 
 # ── Bank statement import ─────────────────────────────────────
 @app.route("/api/expenses/import", methods=["POST"])
+@requires_auth
 def import_bank_statement():
     """Parse uploaded bank statement CSV and auto-categorize transactions."""
     import asyncio as _asyncio
@@ -579,7 +778,7 @@ Rules:
 
     try:
         raw = _asyncio.run(_categorize())
-        match = re.search(r'\[.*?\]', raw, re.DOTALL)
+        match = re.search(r'\[.*\]', raw, re.DOTALL)
         if not match:
             return jsonify({"error": "Could not parse transactions", "raw": raw[:500]}), 400
 
@@ -684,6 +883,7 @@ Write a specific, factual brief. Use direct language. No filler. This will be re
 
 
 @app.route("/api/vitals/chat", methods=["POST"])
+@requires_auth
 def vitals_chat():
     import asyncio as _asyncio
 
@@ -765,7 +965,7 @@ def vitals_chat():
         else:
             messages.append({"role": "user", "content": message})
 
-        return await call_llm(messages, tier="heavy", max_tokens=500, temperature=0.8)
+        return await call_llm(messages, tier="heavy", max_tokens=2000, temperature=0.8)
 
     try:
         coach_response = _asyncio.run(_respond())
@@ -790,11 +990,13 @@ def vitals_chat():
 
 
 @app.route("/api/vitals/history", methods=["GET"])
+@requires_auth
 def vitals_history():
     return jsonify(load_json(VITALS_FILE))
 
 
 @app.route("/api/vitals/insights", methods=["GET"])
+@requires_auth
 def vitals_insights():
     """Weekly pattern synthesis across all vitals check-ins."""
     import asyncio as _asyncio
@@ -826,7 +1028,7 @@ Be specific. Reference actual things he said. No generic advice."""
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=600, temperature=0.7
+            tier="heavy", max_tokens=2400, temperature=0.7
         )
 
     try:
@@ -838,6 +1040,7 @@ Be specific. Reference actual things he said. No generic advice."""
 
 # ── Goals & Alignment ─────────────────────────────────────────
 @app.route("/api/goals", methods=["GET"])
+@requires_auth
 def get_goals():
     goals = load_json(GOALS_FILE)
     # Enrich each goal with time logged this week
@@ -861,6 +1064,7 @@ def get_goals():
 
 
 @app.route("/api/goals", methods=["POST"])
+@requires_auth
 def add_goal():
     d = request.get_json()
     goals = load_json(GOALS_FILE)
@@ -882,6 +1086,7 @@ def add_goal():
 
 
 @app.route("/api/goals/<goal_id>", methods=["PUT"])
+@requires_auth
 def update_goal(goal_id):
     goals = load_json(GOALS_FILE)
     d = request.get_json()
@@ -894,6 +1099,7 @@ def update_goal(goal_id):
 
 
 @app.route("/api/goals/<goal_id>", methods=["DELETE"])
+@requires_auth
 def delete_goal(goal_id):
     goals = [g for g in load_json(GOALS_FILE) if g["id"] != goal_id]
     save_json(GOALS_FILE, goals)
@@ -902,11 +1108,13 @@ def delete_goal(goal_id):
 
 # ── Decision Journal ───────────────────────────────────────────
 @app.route("/api/decisions", methods=["GET"])
+@requires_auth
 def get_decisions():
     return jsonify(load_json(DECISIONS_FILE))
 
 
 @app.route("/api/decisions", methods=["POST"])
+@requires_auth
 def add_decision():
     d = request.get_json()
     decisions = load_json(DECISIONS_FILE)
@@ -918,6 +1126,7 @@ def add_decision():
         "alternatives": d.get("alternatives", ""),
         "confidence": int(d.get("confidence", 7)),
         "session_id": d.get("session_id", ""),
+        "review_date": d.get("review_date") or None,
         "outcome": None,
         "lesson": None,
         "outcome_date": None,
@@ -937,6 +1146,7 @@ def add_decision():
 
 
 @app.route("/api/decisions/<decision_id>", methods=["PUT"])
+@requires_auth
 def update_decision(decision_id):
     decisions = load_json(DECISIONS_FILE)
     d = request.get_json()
@@ -951,6 +1161,7 @@ def update_decision(decision_id):
 
 
 @app.route("/api/decisions/<decision_id>", methods=["DELETE"])
+@requires_auth
 def delete_decision(decision_id):
     decisions = [d for d in load_json(DECISIONS_FILE) if d["id"] != decision_id]
     save_json(DECISIONS_FILE, decisions)
@@ -959,6 +1170,7 @@ def delete_decision(decision_id):
 
 # ── Personal CRM ───────────────────────────────────────────────
 @app.route("/api/crm", methods=["GET"])
+@requires_auth
 def get_crm():
     contacts = load_json(CRM_FILE)
     # Sort by next action date (overdue first)
@@ -967,6 +1179,7 @@ def get_crm():
 
 
 @app.route("/api/crm", methods=["POST"])
+@requires_auth
 def add_contact():
     d = request.get_json()
     contacts = load_json(CRM_FILE)
@@ -989,6 +1202,7 @@ def add_contact():
 
 
 @app.route("/api/crm/<contact_id>", methods=["PUT"])
+@requires_auth
 def update_contact(contact_id):
     contacts = load_json(CRM_FILE)
     d = request.get_json()
@@ -1001,10 +1215,94 @@ def update_contact(contact_id):
 
 
 @app.route("/api/crm/<contact_id>", methods=["DELETE"])
+@requires_auth
 def delete_contact(contact_id):
     contacts = [c for c in load_json(CRM_FILE) if c["id"] != contact_id]
     save_json(CRM_FILE, contacts)
     return jsonify({"ok": True})
+
+
+# ── Pipeline & MRR ─────────────────────────────────────────────
+PIPELINE_FILE = DATA_DIR / "pipeline.json"
+PIPELINE_STAGES = ["lead", "contacted", "demo", "proposal", "won", "lost"]
+
+
+@app.route("/api/pipeline", methods=["GET"])
+@requires_auth
+def get_pipeline():
+    entries = load_json(PIPELINE_FILE)
+    entries.sort(key=lambda p: (p.get("next_action_date") or "9999-99-99"))
+    return jsonify(entries)
+
+
+@app.route("/api/pipeline", methods=["POST"])
+@requires_auth
+def add_pipeline_entry():
+    d = request.get_json()
+    entries = load_json(PIPELINE_FILE)
+    entry = {
+        "id": str(uuid.uuid4())[:8],
+        "name": d.get("name", ""),
+        "stage": d.get("stage", "lead") if d.get("stage") in PIPELINE_STAGES else "lead",
+        "mrr_value": float(d.get("mrr_value", 0) or 0),
+        "setup_value": float(d.get("setup_value", 0) or 0),
+        "source": d.get("source", ""),
+        "next_action": d.get("next_action", ""),
+        "next_action_date": d.get("next_action_date", ""),
+        "notes": d.get("notes", ""),
+        "created": datetime.now().strftime("%Y-%m-%d"),
+        "updated": datetime.now().isoformat(),
+        "won_date": datetime.now().strftime("%Y-%m-%d") if d.get("stage") == "won" else None,
+        "lost_reason": None,
+    }
+    entries.append(entry)
+    save_json(PIPELINE_FILE, entries)
+    return jsonify(entry)
+
+
+@app.route("/api/pipeline/<entry_id>", methods=["PUT"])
+@requires_auth
+def update_pipeline_entry(entry_id):
+    entries = load_json(PIPELINE_FILE)
+    d = request.get_json()
+    for p in entries:
+        if p["id"] == entry_id:
+            new_stage = d.get("stage")
+            if new_stage == "won" and p.get("stage") != "won":
+                d["won_date"] = datetime.now().strftime("%Y-%m-%d")
+            p.update({k: v for k, v in d.items() if k not in ("id", "created")})
+            p["updated"] = datetime.now().isoformat()
+            break
+    save_json(PIPELINE_FILE, entries)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pipeline/<entry_id>", methods=["DELETE"])
+@requires_auth
+def delete_pipeline_entry(entry_id):
+    entries = [p for p in load_json(PIPELINE_FILE) if p["id"] != entry_id]
+    save_json(PIPELINE_FILE, entries)
+    return jsonify({"ok": True})
+
+
+@app.route("/api/pipeline/summary", methods=["GET"])
+@requires_auth
+def pipeline_summary():
+    import gap_engine
+    entries = load_json(PIPELINE_FILE)
+    goals = load_json(GOALS_FILE)
+    mrr_goal = next((g for g in goals if g.get("id") == "mrr-50k"), None)
+    target = 50000
+    deadline = mrr_goal.get("deadline") if mrr_goal else None
+    if mrr_goal:
+        try:
+            target = float(str(mrr_goal.get("target", "50000")).replace(",", ""))
+        except ValueError:
+            pass
+    gap = gap_engine.compute_mrr_gap(entries, target=target, deadline_iso=deadline)
+    expenses = load_json(EXPENSES_FILE)
+    runway = gap_engine.compute_runway(expenses, entries)
+    return jsonify({**gap, "runway": runway})
 
 
 # ── Conviction Training ────────────────────────────────────────
@@ -1023,6 +1321,7 @@ START with a specific, widely-held belief to react to. Keep responses SHORT (2-3
 
 
 @app.route("/api/conviction-train/chat", methods=["POST"])
+@requires_auth
 def conviction_train_chat():
     """Conviction training conversation — builds the muscle of independent thinking."""
     import asyncio as _asyncio
@@ -1062,11 +1361,13 @@ def conviction_train_chat():
 
 
 @app.route("/api/conviction-train/history", methods=["GET"])
+@requires_auth
 def conviction_train_history():
     return jsonify(load_json(CONVICTION_CHAT_FILE))
 
 
 @app.route("/api/conviction-train/extract", methods=["POST"])
+@requires_auth
 def conviction_train_extract():
     """Extract strong convictions from the conversation and store them."""
     import asyncio as _asyncio
@@ -1118,11 +1419,13 @@ Return ONLY valid JSON, no explanation."""
 
 
 @app.route("/api/convictions", methods=["GET"])
+@requires_auth
 def get_convictions():
     return jsonify(load_json(CONVICTIONS_FILE))
 
 
 @app.route("/api/convictions/<conviction_id>", methods=["PUT"])
+@requires_auth
 def update_conviction(conviction_id):
     d = request.get_json()
     convictions = load_json(CONVICTIONS_FILE)
@@ -1137,10 +1440,9 @@ def update_conviction(conviction_id):
             if new_status in ("validated", "invalidated") and old_status not in ("validated", "invalidated"):
                 try:
                     kb = KB_PATH.read_text() if KB_PATH.exists() else "# Knowledge Base\n"
-                    board_tests = c.get("board_tests", 0)
                     entry = (f"\n- [{datetime.now().strftime('%Y-%m-%d')}] Conviction [{new_status.upper()}]: "
-                             f"\"{c.get('belief', '')[:120]}\" — "
-                             f"held since {c.get('created', '')[:10]}, tested {board_tests}x via board. "
+                             f"\"{c.get('thesis', '')[:120]}\" — "
+                             f"held since {c.get('date', '')[:10]}. "
                              f"(source: conviction tracker)")
                     if "## Validated Convictions" in kb:
                         kb = kb.replace("## Validated Convictions\n",
@@ -1156,6 +1458,7 @@ def update_conviction(conviction_id):
 
 
 @app.route("/api/convictions/<conviction_id>", methods=["DELETE"])
+@requires_auth
 def delete_conviction(conviction_id):
     convictions = [c for c in load_json(CONVICTIONS_FILE) if c["id"] != conviction_id]
     save_json(CONVICTIONS_FILE, convictions)
@@ -1164,12 +1467,14 @@ def delete_conviction(conviction_id):
 
 # ── Knowledge Base ─────────────────────────────────────────────
 @app.route("/api/kb", methods=["GET"])
+@requires_auth
 def get_kb():
     content = KB_PATH.read_text() if KB_PATH.exists() else "# Knowledge Base\n\nNothing accumulated yet. Board sessions, decisions, and briefs auto-update this over time."
     return jsonify({"content": content})
 
 
 @app.route("/api/kb", methods=["PUT"])
+@requires_auth
 def update_kb():
     d = request.get_json()
     KB_PATH.parent.mkdir(exist_ok=True)
@@ -1179,6 +1484,7 @@ def update_kb():
 
 # ── Weekly Retrospective ───────────────────────────────────────
 @app.route("/api/retrospective", methods=["POST"])
+@requires_auth
 def retrospective():
     import asyncio as _asyncio
     from datetime import date, timedelta
@@ -1251,7 +1557,7 @@ Be specific. Reference actual numbers and decisions from the data. Under 400 wor
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=700, temperature=0.7
+            tier="heavy", max_tokens=2800, temperature=0.7
         )
 
     try:
@@ -1266,6 +1572,7 @@ Be specific. Reference actual numbers and decisions from the data. Under 400 wor
 
 # ── Opportunity Scanner ────────────────────────────────────────
 @app.route("/api/scan", methods=["POST"])
+@requires_auth
 def opportunity_scan():
     """Scan for specific opportunities relevant to Hariv's businesses."""
     import asyncio as _asyncio
@@ -1331,7 +1638,7 @@ Be specific. Under 300 words."""
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=600, temperature=0.7
+            tier="heavy", max_tokens=2400, temperature=0.7
         )
 
     try:
@@ -1343,6 +1650,7 @@ Be specific. Under 300 words."""
 
 # ── Home / Daily OS ───────────────────────────────────────────
 @app.route("/api/home", methods=["GET"])
+@requires_auth
 def home_data():
     from datetime import date, timedelta
     today = date.today()
@@ -1411,6 +1719,27 @@ def home_data():
             "velocity": "moving" if signal >= 3 else ("slow" if signal > 0 else "stalled"),
         }
 
+    # Pipeline / MRR gap + runway (Tier 4)
+    import gap_engine
+    pipeline = load_json(PIPELINE_FILE) if PIPELINE_FILE.exists() else []
+    mrr_goal = next((g for g in goals if g.get("id") == "mrr-50k"), None)
+    target = 50000
+    mrr_deadline = mrr_goal.get("deadline") if mrr_goal else None
+    if mrr_goal:
+        try:
+            target = float(str(mrr_goal.get("target", "50000")).replace(",", ""))
+        except ValueError:
+            pass
+    mrr_gap = gap_engine.compute_mrr_gap(pipeline, target=target, deadline_iso=mrr_deadline)
+    runway = gap_engine.compute_runway(load_json(EXPENSES_FILE), pipeline)
+
+    # Commitment scoreboard (Tier 5a)
+    commitment_scoreboard = gap_engine.compute_commitment_scoreboard(_load_recs())
+    commitment_scoreboard.pop("broken_items", None)  # keep /api/home light; full list via /api/recommendations
+
+    # Decision calibration (Tier 5b)
+    calibration = gap_engine.compute_decision_calibration(load_json(DECISIONS_FILE))
+
     return jsonify({
         "today": today.isoformat(),
         "mode": "morning" if datetime.now().hour < 14 else "evening",
@@ -1428,28 +1757,37 @@ def home_data():
         "log_streak": streak,
         "pending_recs": pending_recs,
         "goal_velocity": goal_velocity,
+        "mrr_gap": mrr_gap,
+        "runway": runway,
+        "commitment_scoreboard": commitment_scoreboard,
+        "calibration": calibration,
     })
 
 
 @app.route("/api/home/morning/clear", methods=["POST"])
+@requires_auth
 def clear_morning_cache():
     save_json(MORNING_CACHE_FILE, {"date": "none", "content": ""})
     return jsonify({"ok": True})
 
 
 @app.route("/api/cron/morning", methods=["POST"])
+@requires_localhost
 def cron_morning_trigger():
     """Called by cron at 5:30am IST. Generates and caches morning brief."""
+    import threading
     save_json(MORNING_CACHE_FILE, {"date": "none", "content": ""})
-    import requests as _req
-    try:
-        _req.post("http://localhost:4000/api/home/morning", json={}, timeout=120)
-    except Exception:
-        pass
-    return jsonify({"ok": True})
+    def _run():
+        try:
+            _generate_morning_brief()
+        except Exception as e:
+            print(f"[CRON] Morning brief failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "message": "Morning brief generation started"})
 
 
 @app.route("/api/cron/intel", methods=["POST"])
+@requires_localhost
 def cron_intel_trigger():
     """Called by cron at 5:00am IST. Skips if today's brief already exists (idempotent)."""
     from datetime import date
@@ -1469,6 +1807,7 @@ def cron_intel_trigger():
 
 
 @app.route("/api/cron/weekly", methods=["POST"])
+@requires_localhost
 def cron_weekly_trigger():
     """Called by cron Sunday evening. Generates weekly cross-module synthesis."""
     import threading
@@ -1481,7 +1820,83 @@ def cron_weekly_trigger():
     return jsonify({"ok": True, "message": "Weekly synthesis started"})
 
 
+@app.route("/api/cron/kb-consolidate", methods=["POST"])
+@requires_localhost
+def cron_kb_consolidate():
+    """Monthly job: rewrite knowledge_base.md to merge duplicates / drop stale items."""
+    import threading, asyncio as _asyncio
+    from board import consolidate_knowledge_base
+    def _run():
+        try:
+            _asyncio.run(consolidate_knowledge_base())
+        except Exception as e:
+            print(f"[KB CONSOLIDATE] failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "message": "KB consolidation started"})
+
+
+@app.route("/api/cron/auto-board", methods=["POST"])
+@requires_localhost
+def cron_auto_board():
+    """
+    Sunday auto-board: the board convenes on its own over the week's data —
+    logs, pipeline movement, gap engine output, broken commitments — and
+    pushes a verdict + next week's priority via Telegram. No prompt needed
+    from Hariv; this is the board reaching out instead of waiting to be asked.
+    """
+    import threading, asyncio as _asyncio
+    def _run():
+        try:
+            gap = _mrr_gap_for_prompt()
+            scoreboard = _commitment_scoreboard_for_prompt()
+            question = (
+                "It's Sunday. Review this week on your own initiative: what happened in the pipeline, "
+                "what commitments were kept or broken, and what the MRR gap trajectory looks like. "
+                f"Context: {gap} {scoreboard} "
+                "Give a 5-bullet verdict on the week and name ONE priority for next week — the single "
+                "highest-leverage thing, with a concrete deadline."
+            )
+            result = _asyncio.run(run_board(question))
+            try:
+                from tools.telegram_bot import send as _tg_send
+                lines = [f"*Sunday Board Verdict*"]
+                for r in result.get("responses", []):
+                    lines.append(f"\n*{r['name']}:* {r['response'][:600]}")
+                if result.get("synthesis"):
+                    lines.append(f"\n*Synthesis:* {result['synthesis']}")
+                _tg_send("\n".join(lines))
+            except Exception as e:
+                print(f"[AUTO-BOARD] telegram push failed: {e}")
+        except Exception as e:
+            print(f"[AUTO-BOARD] failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "message": "Sunday auto-board started"})
+
+
+def _mrr_gap_for_prompt():
+    import gap_engine
+    pipeline = load_json(PIPELINE_FILE) if PIPELINE_FILE.exists() else []
+    goals = load_json(GOALS_FILE)
+    mrr_goal = next((g for g in goals if g.get("id") == "mrr-50k"), None)
+    target = 50000
+    deadline = mrr_goal.get("deadline") if mrr_goal else None
+    if mrr_goal:
+        try:
+            target = float(str(mrr_goal.get("target", "50000")).replace(",", ""))
+        except ValueError:
+            pass
+    gap = gap_engine.compute_mrr_gap(pipeline, target=target, deadline_iso=deadline)
+    return f"MRR: current ₹{gap['current_mrr']:,.0f}, gap ₹{gap['gap']:,.0f}, {gap['months_left']}mo left."
+
+
+def _commitment_scoreboard_for_prompt():
+    import gap_engine
+    scoreboard = gap_engine.compute_commitment_scoreboard(_load_recs())
+    return f"Commitments: {scoreboard['kept']} kept, {scoreboard['broken']} broken."
+
+
 @app.route("/api/weekly", methods=["GET"])
+@requires_auth
 def get_weekly_synthesis():
     """Return the latest weekly synthesis."""
     files = sorted(BRIEFS_DIR.glob("weekly_*.md"), reverse=True)
@@ -1491,12 +1906,142 @@ def get_weekly_synthesis():
     return jsonify({"content": f.read_text(), "date": f.stem.replace("weekly_", "")})
 
 
+WEEKLY_PRIORITY_FILE = DATA_DIR / "weekly_priority.json"
+
+
+@app.route("/api/weekly/priority", methods=["GET"])
+@requires_auth
+def get_weekly_priority():
+    """The confirmed ONE priority for the current week (part of the Sunday review ritual)."""
+    d = load_json(WEEKLY_PRIORITY_FILE) if WEEKLY_PRIORITY_FILE.exists() else {}
+    return jsonify(d if isinstance(d, dict) else {})
+
+
+@app.route("/api/weekly/priority", methods=["POST"])
+@requires_auth
+def set_weekly_priority():
+    d = request.get_json()
+    save_json(WEEKLY_PRIORITY_FILE, {
+        "priority": d.get("priority", ""),
+        "week_of": (datetime.now() - timedelta(days=datetime.now().weekday())).strftime("%Y-%m-%d"),
+        "updated": datetime.now().isoformat(),
+    })
+    return jsonify({"ok": True})
+
+
+def _weekly_wrapped_stats():
+    """
+    Deterministic week-over-week numbers — computed in code, not by the LLM, so the
+    weekly brief opens with a stats block that's always correct even if the model
+    narrative above/below it hallucinates a number. The "Rosebud/Mindsera weekly
+    wrapped" pattern applied to business + accountability metrics instead of mood.
+    """
+    import gap_engine
+    from datetime import date, timedelta
+    today = date.today()
+    week_start = today - timedelta(days=7)
+    prev_week_start = today - timedelta(days=14)
+
+    logs = load_json(DAILY_LOG_FILE)
+    week_logs = [l for l in logs if l.get("date", "") >= week_start.isoformat()]
+    prev_logs = [l for l in logs if prev_week_start.isoformat() <= l.get("date", "") < week_start.isoformat()]
+
+    def _avg_energy(entries):
+        vals = [float(l["energy"]) for l in entries if l.get("energy") not in (None, "")]
+        return round(sum(vals) / len(vals), 1) if vals else None
+
+    energy_this = _avg_energy(week_logs)
+    energy_prev = _avg_energy(prev_logs)
+
+    time_logs = load_json(TIME_FILE)
+    week_time = [l for l in time_logs if l.get("date", "") >= week_start.isoformat()]
+    prev_time = [l for l in time_logs if prev_week_start.isoformat() <= l.get("date", "") < week_start.isoformat()]
+
+    def _by_cat(entries):
+        by_cat = {}
+        for l in entries:
+            by_cat[l.get("category", "Other")] = by_cat.get(l.get("category", "Other"), 0) + float(l.get("hours", 0))
+        return by_cat
+
+    hours_this = _by_cat(week_time)
+    hours_prev = _by_cat(prev_time)
+    total_this = sum(hours_this.values())
+    total_prev = sum(hours_prev.values())
+
+    rev_this = sum(v for k, v in hours_this.items() if k in ("Agency Work", "TENANTZA SaaS"))
+    rev_prev = sum(v for k, v in hours_prev.items() if k in ("Agency Work", "TENANTZA SaaS"))
+    momentum_this = round(rev_this / total_this * 100) if total_this else None
+    momentum_prev = round(rev_prev / total_prev * 100) if total_prev else None
+
+    # Log streak (same definition as /api/home)
+    streak = 0
+    check = today
+    for _ in range(30):
+        if any(l.get("date") == check.isoformat() for l in logs):
+            streak += 1
+            check = check - timedelta(days=1)
+        else:
+            break
+
+    pipeline = load_json(PIPELINE_FILE) if PIPELINE_FILE.exists() else []
+    goals = load_json(GOALS_FILE)
+    mrr_goal = next((g for g in goals if g.get("id") == "mrr-50k"), None)
+    target = 50000
+    deadline = mrr_goal.get("deadline") if mrr_goal else None
+    if mrr_goal:
+        try:
+            target = float(str(mrr_goal.get("target", "50000")).replace(",", ""))
+        except ValueError:
+            pass
+    mrr_gap = gap_engine.compute_mrr_gap(pipeline, target=target, deadline_iso=deadline)
+    mrr_added_this_week = sum(
+        float(p.get("mrr_value", 0) or 0) for p in pipeline
+        if p.get("stage") == "won" and (p.get("won_date") or "") >= week_start.isoformat()
+    )
+
+    scoreboard = gap_engine.compute_commitment_scoreboard(_load_recs())
+    calibration = gap_engine.compute_decision_calibration(load_json(DECISIONS_FILE))
+
+    return {
+        "week_start": week_start.isoformat(), "today": today.isoformat(),
+        "energy_this": energy_this, "energy_prev": energy_prev,
+        "hours_this": hours_this, "total_this": round(total_this, 1), "total_prev": round(total_prev, 1),
+        "momentum_this": momentum_this, "momentum_prev": momentum_prev,
+        "log_streak": streak,
+        "mrr_gap": mrr_gap, "mrr_added_this_week": mrr_added_this_week,
+        "commitment_scoreboard": scoreboard,
+        "calibration": calibration,
+    }
+
+
+def _format_wrapped_block(s):
+    lines = ["## Week in Numbers"]
+    if s["energy_this"] is not None:
+        delta = f" ({'+' if s['energy_this']-(s['energy_prev'] or s['energy_this'])>=0 else ''}{round(s['energy_this']-(s['energy_prev'] or s['energy_this']),1)} vs last week)" if s["energy_prev"] is not None else ""
+        lines.append(f"- Energy: {s['energy_this']}/10 avg{delta}")
+    if s["momentum_this"] is not None:
+        delta = f" ({'+' if s['momentum_this']-(s['momentum_prev'] or s['momentum_this'])>=0 else ''}{s['momentum_this']-(s['momentum_prev'] or s['momentum_this'])}pp vs last week)" if s["momentum_prev"] is not None else ""
+        lines.append(f"- Momentum: {s['momentum_this']}% revenue work{delta} — {s['total_this']}h logged")
+    lines.append(f"- Log streak: {s['log_streak']} days")
+    gap = s["mrr_gap"]
+    lines.append(f"- MRR: ₹{gap['current_mrr']:,.0f}/₹{gap['target']:,.0f} (gap ₹{gap['gap']:,.0f})"
+                 + (f", +₹{s['mrr_added_this_week']:,.0f} won this week" if s["mrr_added_this_week"] else ""))
+    cs = s["commitment_scoreboard"]
+    if cs["kept"] or cs["broken"]:
+        lines.append(f"- Commitments: {cs['kept']} kept, {cs['broken']} broken ({cs['kept_ratio_pct']}%)")
+    if s["calibration"].get("verdict"):
+        lines.append(f"- Calibration: {s['calibration']['verdict']}")
+    return "\n".join(lines)
+
+
 def _generate_weekly_synthesis():
     """Pull from all 8 modules and synthesize the week's real patterns."""
     import asyncio as _asyncio
     from datetime import date, timedelta
     today = date.today()
     week_start = (today - timedelta(days=7)).isoformat()
+    wrapped_stats = _weekly_wrapped_stats()
+    wrapped_block = _format_wrapped_block(wrapped_stats)
 
     # --- Pull from every module ---
 
@@ -1551,6 +2096,9 @@ def _generate_weekly_synthesis():
 
 WEEK OF {week_start} to {today.isoformat()}
 
+{wrapped_block}
+(These numbers are computed, not estimated — reference them exactly, don't restate different figures.)
+
 DAILY LOGS ({days_logged}/7 days logged, {days_missing} days missing):
 {log_block or 'No logs this week.'}
 
@@ -1594,10 +2142,13 @@ Write a weekly synthesis. Be direct, specific, and honest. Structure:
 
 Write as someone who has seen all the data and sees the full picture. Not harsh, not gentle — just clear."""
 
-    content = _asyncio.run(call_llm(
+    narrative = _asyncio.run(call_llm(
         [{"role": "user", "content": prompt}],
-        tier="heavy", max_tokens=800, temperature=0.7
+        tier="heavy", max_tokens=3200, temperature=0.7
     )).strip()
+    # Prepend the deterministic stats block verbatim rather than trusting the model to
+    # restate it — guarantees the numbers Hariv sees first are always exactly right.
+    content = f"{wrapped_block}\n\n---\n\n{narrative}"
 
     BRIEFS_DIR.mkdir(exist_ok=True)
     out_file = BRIEFS_DIR / f"weekly_{today.isoformat()}.md"
@@ -1606,8 +2157,9 @@ Write as someone who has seen all the data and sees the full picture. Not harsh,
     return content
 
 
-@app.route("/api/home/morning", methods=["POST"])
-def morning_brief():
+def _generate_morning_brief():
+    """Generates (or serves cached) morning brief. Shared by the /api/home/morning route,
+    the cron trigger, and the Telegram bot — one code path, no in-process HTTP hop."""
     import asyncio as _asyncio
     from datetime import date, timedelta
 
@@ -1619,7 +2171,7 @@ def morning_brief():
         raw = load_json(MORNING_CACHE_FILE)
         cache = raw if isinstance(raw, dict) else {}
     if cache.get("date") == today and cache.get("content"):
-        return jsonify({"brief": cache["content"], "cached": True})
+        return {"brief": cache["content"], "cached": True}
 
     logs = load_json(DAILY_LOG_FILE)
     yesterday = (date.today() - timedelta(days=1)).isoformat()
@@ -1757,28 +2309,46 @@ Under 400 words. Direct. No filler."""
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=750, temperature=0.75
+            tier="heavy", max_tokens=3000, temperature=0.75
         )
 
+    result = _asyncio.run(_gen())
+    save_json(MORNING_CACHE_FILE, {"date": today, "content": result})
+    # Also persist to briefs/ so morning briefs are never lost
+    BRIEFS_DIR.mkdir(exist_ok=True)
+    morning_file = BRIEFS_DIR / f"morning_{today}.md"
+    if not morning_file.exists():
+        morning_file.write_text(result)
+    return {"brief": result, "cached": False}
+
+
+@app.route("/api/home/morning", methods=["POST"])
+@requires_auth
+def morning_brief():
     try:
-        result = _asyncio.run(_gen())
-        save_json(MORNING_CACHE_FILE, {"date": today, "content": result})
-        # Also persist to briefs/ so morning briefs are never lost
-        BRIEFS_DIR.mkdir(exist_ok=True)
-        morning_file = BRIEFS_DIR / f"morning_{today}.md"
-        if not morning_file.exists():
-            morning_file.write_text(result)
-        return jsonify({"brief": result, "cached": False})
+        return jsonify(_generate_morning_brief())
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
 
 
-@app.route("/api/home/evening", methods=["POST"])
-def evening_reflection():
+EVENING_CACHE_FILE = DATA_DIR / "evening_cache.json"
+
+
+def _generate_evening_brief():
+    """Generates (or serves cached) evening brief. Shared by the /api/home/evening route,
+    the Telegram evening ritual, and the cron push job."""
     import asyncio as _asyncio
     from datetime import date, timedelta
 
     today = date.today().isoformat()
+
+    cache = {}
+    if EVENING_CACHE_FILE.exists():
+        raw = load_json(EVENING_CACHE_FILE)
+        cache = raw if isinstance(raw, dict) else {}
+    if cache.get("date") == today and cache.get("content"):
+        return {"reflection": cache["content"], "cached": True}
+
     logs = load_json(DAILY_LOG_FILE)
     today_log = next((l for l in reversed(logs) if l.get("date") == today), None)
     recent_logs = [l for l in logs if l.get("date","") >= (date.today()-timedelta(days=7)).isoformat()]
@@ -1857,22 +2427,35 @@ Under 320 words. No filler. The quality of this determines the quality of tomorr
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=580, temperature=0.8
+            tier="heavy", max_tokens=2400, temperature=0.8
         )
 
+    result = _asyncio.run(_gen())
+    save_json(EVENING_CACHE_FILE, {"date": today, "content": result})
+    BRIEFS_DIR.mkdir(exist_ok=True)
+    evening_file = BRIEFS_DIR / f"evening_{today}.md"
+    if not evening_file.exists():
+        evening_file.write_text(result)
+    return {"reflection": result, "cached": False}
+
+
+@app.route("/api/home/evening", methods=["POST"])
+@requires_auth
+def evening_reflection():
     try:
-        result = _asyncio.run(_gen())
-        return jsonify({"reflection": result})
+        return jsonify(_generate_evening_brief())
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
 
 
 @app.route("/api/daily-log", methods=["GET"])
+@requires_auth
 def get_daily_logs():
     return jsonify(load_json(DAILY_LOG_FILE))
 
 
 @app.route("/api/daily-log/today", methods=["GET"])
+@requires_auth
 def get_today_log():
     logs = load_json(DAILY_LOG_FILE)
     today = datetime.now().strftime("%Y-%m-%d")
@@ -1880,6 +2463,7 @@ def get_today_log():
 
 
 @app.route("/api/daily-log", methods=["POST"])
+@requires_auth
 def save_daily_log():
     d = request.get_json()
     logs = load_json(DAILY_LOG_FILE)
@@ -1903,6 +2487,7 @@ def save_daily_log():
 
     save_json(DAILY_LOG_FILE, logs)
     save_json(MORNING_CACHE_FILE, {"date": "none", "content": ""})
+    save_json(EVENING_CACHE_FILE, {"date": "none", "content": ""})
 
     # Async: extract pattern from this log and append to KB
     def _append_log_to_kb():

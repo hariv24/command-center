@@ -27,7 +27,13 @@ __pycache__/
 *.pyo
 venv/
 .venv/
+.rag_venv/
 *.egg-info/
+
+# RAG corpus — copyrighted books + large binaries, VM has its own copy
+content/
+rag_sources/
+chroma_db/
 
 # Temp files
 .tmp/
@@ -40,3 +46,5 @@ venv/
 !data/.gitkeep
 !sessions/.gitkeep
 !briefs/.gitkeep
+.deploy.env
+personal_rag_db/

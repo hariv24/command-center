@@ -2,15 +2,16 @@
 Embed advisor source material into a Chroma vector DB.
 
 Run on the MacBook (fast local embedding, no API cost):
-    pip install chromadb sentence-transformers
-    python3 tools/build_advisor_rag.py            # full rebuild
-    python3 tools/build_advisor_rag.py --update   # only embed new files
+    pip install chromadb fastembed
+    python3 tools/build_advisor_rag.py            # full rebuild (wipes + re-embeds everything)
+    python3 tools/build_advisor_rag.py --update   # only embed new files, keep existing vectors
 
-Then push to the VM:
-    rsync -avz -e "ssh -i key/ssh-key-2026-06-27.key" chroma_db/ ubuntu@140.245.237.122:~/agent/chroma_db/
+Then push to the server:
+    rsync -avz -e "ssh -i key/<your-key>" chroma_db/ ubuntu@<host>:~/agent/chroma_db/
 
 Chunking: ~300 words per chunk with 40-word overlap (~400 tokens / 50 overlap).
-Embedding model: sentence-transformers all-mpnet-base-v2 (free, runs on Metal).
+Embedding model: fastembed BAAI/bge-base-en-v1.5 (ONNX runtime, no PyTorch — same
+model used by tools/query_advisor_rag.py so vectors stay compatible on both ends).
 """
 
 import re
@@ -23,6 +24,7 @@ DB_DIR = ROOT / "chroma_db"
 
 CHUNK_WORDS = 300
 OVERLAP_WORDS = 40
+EMBED_MODEL = "BAAI/bge-base-en-v1.5"
 
 SLUG_TO_NAME = {
     "elon_musk": "Elon Musk", "jeff_bezos": "Jeff Bezos",
@@ -56,16 +58,25 @@ def _chunk(text):
 
 def build(update_only=False):
     import chromadb
-    from sentence_transformers import SentenceTransformer
+    from fastembed import TextEmbedding
 
-    model = SentenceTransformer("all-mpnet-base-v2")
+    model = TextEmbedding(model_name=EMBED_MODEL)
     client = chromadb.PersistentClient(path=str(DB_DIR))
 
     for slug, name in SLUG_TO_NAME.items():
         raw_dir = SOURCES_DIR / slug / "raw"
         if not raw_dir.exists():
             continue
+
+        if not update_only:
+            # Model changed => old vectors are a different vector space entirely.
+            # Wipe and re-embed rather than mixing incompatible embeddings.
+            try:
+                client.delete_collection(f"advisor_{slug}")
+            except Exception:
+                pass
         coll = client.get_or_create_collection(f"advisor_{slug}")
+
         existing_sources = set()
         if update_only and coll.count():
             existing_sources = {m["file"] for m in coll.get(include=["metadatas"])["metadatas"]}
@@ -83,7 +94,7 @@ def build(update_only=False):
             print(f"{name}: nothing new")
             continue
         print(f"{name}: embedding {len(docs)} chunks...")
-        embeddings = model.encode(docs, show_progress_bar=True, batch_size=64)
+        embeddings = list(model.embed(docs, batch_size=64))
         # Chroma add in batches
         B = 500
         for i in range(0, len(docs), B):
@@ -95,7 +106,7 @@ def build(update_only=False):
             )
         print(f"{name}: collection now has {coll.count()} chunks")
 
-    print(f"\nDB written to {DB_DIR}. rsync it to the VM (see module docstring).")
+    print(f"\nDB written to {DB_DIR}. rsync it to the server (see module docstring).")
 
 
 if __name__ == "__main__":
