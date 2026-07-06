@@ -1072,15 +1072,43 @@ function setMode(m){
 }
 
 async function genBrief(force=false){
-  document.getElementById('bph').style.display='none';document.getElementById('bb').classList.remove('on');document.getElementById('bsk').classList.add('on');
+  const bb=document.getElementById('bb'),bsk=document.getElementById('bsk');
+  document.getElementById('bph').style.display='none';bb.classList.remove('on');bsk.classList.add('on');
   if(force&&curMode==='morning')await fetch('/api/home/morning/clear',{method:'POST'}).catch(()=>{});
+  const endpoint=curMode==='morning'?'/api/home/morning':'/api/home/evening';
+  const pollEndpoint=curMode==='morning'?'/api/home/morning/poll':'/api/home/evening/poll';
   try{
-    const d=await post(curMode==='morning'?'/api/home/morning':'/api/home/evening',{});
+    const d=await post(endpoint,{});
     if(d.error)throw new Error(d.error);
-    document.getElementById('bb').innerHTML=marked.parse(d.brief||d.reflection||'');
-    document.getElementById('bb').classList.add('on');
-  }catch(e){document.getElementById('bb').innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';document.getElementById('bb').classList.add('on');}
-  finally{document.getElementById('bsk').classList.remove('on');}
+    if(d.generating){
+      // Generation runs in a background thread server-side (no request timeout to
+      // race against) — poll until the cache file shows up instead of waiting on
+      // one long-held connection, which is what was timing out before.
+      let attempts=0;
+      const MAX_ATTEMPTS=30; // 5 min at 10s intervals
+      await new Promise((resolve,reject)=>{
+        const poll=setInterval(async()=>{
+          attempts++;
+          try{
+            const p=await fetch(pollEndpoint).then(r=>r.json());
+            if(p.done){
+              clearInterval(poll);
+              bb.innerHTML=marked.parse(p.brief||p.reflection||'');bb.classList.add('on');
+              resolve();
+            }else if(attempts>=MAX_ATTEMPTS){
+              clearInterval(poll);reject(new Error('Brief generation timed out after 5 minutes'));
+            }
+          }catch(e){
+            if(attempts>=MAX_ATTEMPTS){clearInterval(poll);reject(e);}
+          }
+        },10000);
+      });
+    }else{
+      bb.innerHTML=marked.parse(d.brief||d.reflection||'');
+      bb.classList.add('on');
+    }
+  }catch(e){bb.innerHTML='<p style="color:var(--red)">'+esc(e.message)+'</p>';bb.classList.add('on');}
+  finally{bsk.classList.remove('on');}
 }
 
 async function saveLog(){

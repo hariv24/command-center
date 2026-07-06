@@ -1096,7 +1096,7 @@ Be specific. Reference actual things he said. No generic advice."""
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=2400, temperature=0.7
+            tier="heavy", max_tokens=2400, temperature=0.7, timeout=150
         )
 
     try:
@@ -1678,7 +1678,7 @@ Be specific. Reference actual numbers and decisions from the data. Under 400 wor
 
     result = await call_llm(
         [{"role": "user", "content": prompt}],
-        tier="heavy", max_tokens=2800, temperature=0.7
+        tier="heavy", max_tokens=2800, temperature=0.7, timeout=150
     )
     retro_path = BRIEFS_DIR / f"retro_{today.isoformat()}.md"
     retro_path.write_text(f"# Weekly Retrospective — {monday.isoformat()} to {today.isoformat()}\n\n{result}")
@@ -1760,7 +1760,7 @@ Be specific. Under 300 words."""
 
     return await call_llm(
         [{"role": "user", "content": prompt}],
-        tier="heavy", max_tokens=2400, temperature=0.7
+        tier="heavy", max_tokens=2400, temperature=0.7, timeout=150
     )
 
 
@@ -2487,7 +2487,7 @@ Under 400 words. Direct. No filler."""
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=3000, temperature=0.75
+            tier="heavy", max_tokens=3000, temperature=0.75, timeout=150
         )
 
     result = _asyncio.run(_gen())
@@ -2503,10 +2503,40 @@ Under 400 words. Direct. No filler."""
 @app.route("/api/home/morning", methods=["POST"])
 @requires_auth
 def morning_brief():
-    try:
-        return jsonify(_generate_morning_brief())
-    except Exception as ex:
-        return jsonify({"error": str(ex)}), 500
+    """
+    Backgrounds generation and lets the client poll instead of blocking the
+    request — the context fed into this prompt (full KB, full wellness state,
+    longer session history) got a lot bigger, and a free-tier model chewing
+    through it plus the fallback chain routinely ran past the client's 30s
+    fetch timeout and gunicorn's worker timeout, surfacing as "it just breaks."
+    Same pattern the intel brief already uses (/api/brief + /api/brief/poll).
+    """
+    from datetime import date
+    import threading
+    today = date.today().isoformat()
+    cache = load_json(MORNING_CACHE_FILE) if MORNING_CACHE_FILE.exists() else {}
+    if isinstance(cache, dict) and cache.get("date") == today and cache.get("content"):
+        return jsonify({"brief": cache["content"], "cached": True})
+
+    def _run():
+        try:
+            _generate_morning_brief()
+        except Exception as e:
+            print(f"[MORNING] generation failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"generating": True})
+
+
+@app.route("/api/home/morning/poll", methods=["GET"])
+@requires_auth
+def morning_brief_poll():
+    from datetime import date
+    today = date.today().isoformat()
+    cache = load_json(MORNING_CACHE_FILE) if MORNING_CACHE_FILE.exists() else {}
+    if isinstance(cache, dict) and cache.get("date") == today and cache.get("content"):
+        return jsonify({"done": True, "brief": cache["content"]})
+    return jsonify({"done": False})
 
 
 EVENING_CACHE_FILE = DATA_DIR / "evening_cache.json"
@@ -2605,7 +2635,7 @@ Under 320 words. No filler. The quality of this determines the quality of tomorr
 
         return await call_llm(
             [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=2400, temperature=0.8
+            tier="heavy", max_tokens=2400, temperature=0.8, timeout=150
         )
 
     result = _asyncio.run(_gen())
@@ -2620,10 +2650,33 @@ Under 320 words. No filler. The quality of this determines the quality of tomorr
 @app.route("/api/home/evening", methods=["POST"])
 @requires_auth
 def evening_reflection():
-    try:
-        return jsonify(_generate_evening_brief())
-    except Exception as ex:
-        return jsonify({"error": str(ex)}), 500
+    """Backgrounds generation + polling — same reasoning as morning_brief() above."""
+    from datetime import date
+    import threading
+    today = date.today().isoformat()
+    cache = load_json(EVENING_CACHE_FILE) if EVENING_CACHE_FILE.exists() else {}
+    if isinstance(cache, dict) and cache.get("date") == today and cache.get("content"):
+        return jsonify({"reflection": cache["content"], "cached": True})
+
+    def _run():
+        try:
+            _generate_evening_brief()
+        except Exception as e:
+            print(f"[EVENING] generation failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"generating": True})
+
+
+@app.route("/api/home/evening/poll", methods=["GET"])
+@requires_auth
+def evening_brief_poll():
+    from datetime import date
+    today = date.today().isoformat()
+    cache = load_json(EVENING_CACHE_FILE) if EVENING_CACHE_FILE.exists() else {}
+    if isinstance(cache, dict) and cache.get("date") == today and cache.get("content"):
+        return jsonify({"done": True, "reflection": cache["content"]})
+    return jsonify({"done": False})
 
 
 @app.route("/api/daily-log", methods=["GET"])
