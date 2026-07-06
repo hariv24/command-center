@@ -599,6 +599,15 @@ def session(session_id):
     return jsonify(data)
 
 
+@app.route("/api/sessions/<session_id>", methods=["DELETE"])
+@requires_auth
+def delete_session_route(session_id):
+    from board import delete_session
+    if not delete_session(session_id):
+        return jsonify({"error": "Session not found"}), 404
+    return jsonify({"ok": True})
+
+
 # ── Finance tracking ──────────────────────────────────────────
 @app.route("/api/expenses", methods=["GET"])
 @requires_auth

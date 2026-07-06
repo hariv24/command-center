@@ -626,6 +626,7 @@ select option{background:var(--s2)}
   <div style="display:flex;gap:8px;margin-top:9px">
     <button class="btn btn-m" id="bdb" onclick="runBoard()" style="flex:1">Convene the Board</button>
     <button class="btn bg" id="bddb" onclick="runDebate()" style="flex:1" title="2 advisors argue opposing sides across two rounds, a 3rd judges — structured disagreement, not a group chat">⚔ Debate Mode</button>
+    <button class="btn bg" id="bdstop" onclick="stopBoard()" style="display:none;flex:0 0 auto;border-color:var(--red);color:var(--red)" title="Stop and keep whatever's finished so far">■ Stop</button>
   </div>
   <div class="err" id="bderr"></div>
   <div class="bspin" id="bdspin">
@@ -1200,9 +1201,9 @@ function _advisorCards(responses){
 // advisor cards as soon as routing arrives, fills each card's text live as
 // tokens stream in, finalizes cards on advisor_done, and resolves with the
 // full turn data once the "done" event fires (or rejects on "error").
-function _driveStream(url,body,{gridEl,routeEl,onRouting}){
+function _driveStream(url,body,{gridEl,routeEl,onRouting,signal}){
   return new Promise((resolve,reject)=>{
-    const collected={advisors:[],reasons:{},responses:{},synthesis:'',sessionId:null,turnNumber:null};
+    const collected={advisors:[],reasons:{},responses:{},synthesis:'',sessionId:null,turnNumber:null,stopped:false};
     let sawError=null;
     streamSSE(url,body,evt=>{
       if(evt.event==='routing'){
@@ -1231,16 +1232,38 @@ function _driveStream(url,body,{gridEl,routeEl,onRouting}){
       }else if(evt.event==='done'){
         collected.sessionId=evt.session_id;collected.turnNumber=evt.turn_number;
       }
-    }).then(()=>{
+    },signal).then(()=>{
       if(!collected.sessionId&&sawError)reject(new Error(sawError));
       else resolve(collected);
-    }).catch(reject);
+    }).catch(e=>{
+      if(e.name==='AbortError'){collected.stopped=true;resolve(collected);}
+      else reject(e);
+    });
   });
+}
+
+// Lets any in-flight board/debate call be cancelled from one Stop button —
+// the server-side work may keep running (there's no cancellation hook into
+// board.py from here), but the client stops waiting and keeps whatever
+// streamed in before the stop, instead of an all-or-nothing wait.
+let _activeAbortController=null;
+function _startStoppable(){
+  _activeAbortController=new AbortController();
+  document.getElementById('bdstop').style.display='inline-flex';
+  return _activeAbortController.signal;
+}
+function _endStoppable(){
+  _activeAbortController=null;
+  document.getElementById('bdstop').style.display='none';
+}
+function stopBoard(){
+  if(_activeAbortController)_activeAbortController.abort();
 }
 
 async function runBoard(){
   const q=document.getElementById('qin').value.trim();if(!q)return;
   const b=document.getElementById('bdb');b.disabled=true;b.textContent='Convening...';
+  const signal=_startStoppable();
   document.getElementById('bdspin').classList.add('on');document.getElementById('bdr').style.display='none';document.getElementById('bderr').classList.remove('on');
   try{
     const gridEl=document.getElementById('bdgrid');
@@ -1249,6 +1272,7 @@ async function runBoard(){
     const collected=await _driveStream('/api/board/stream',{question:q},{
       gridEl,
       routeEl:document.getElementById('bdroute'),
+      signal,
       onRouting:(advisors,reasons)=>{
         document.getElementById('bdspin').classList.remove('on');
         document.getElementById('bdr').style.display='block';
@@ -1275,7 +1299,9 @@ async function runBoard(){
     });
     boardConversation=[{question:q,synthesis:collected.synthesis,responses,target_advisor:null}];
     loadRecs();
-    if(document.getElementById('bd-debate').checked&&collected.advisors.length>1){
+    if(collected.stopped){
+      toast('Stopped — kept whatever finished','ok');
+    }else if(document.getElementById('bd-debate').checked&&collected.advisors.length>1){
       await runDebateRound();
     }
   }catch(e){
@@ -1283,7 +1309,7 @@ async function runBoard(){
     const el=document.getElementById('bderr');el.textContent='Error: '+e.message;el.classList.add('on');
     toast('Board session failed: '+e.message,'err');
   }
-  finally{b.disabled=false;b.textContent='Convene the Board';document.getElementById('bdspin').classList.remove('on');}
+  finally{b.disabled=false;b.textContent='Convene the Board';document.getElementById('bdspin').classList.remove('on');_endStoppable();}
 }
 
 // One extra round: each advisor reacts explicitly to what the others just
@@ -1294,15 +1320,18 @@ async function runDebateRound(){
   const debateQ="What do you think of what the others just said? Push back by name if you disagree, or say plainly where you agree. Answer directly — don't restate this question or describe what you're about to do. Under 150 words.";
   const {gridEl,synthSlot}=_liveTurnShell(boardConversation.length+1,'[Board deliberation round]',null);
   try{
-    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:debateQ,max_tokens:600},{gridEl});
+    // Reuses the same abort controller runBoard() started (this only ever runs
+    // from inside that call, before its finally clears it) — Stop cancels both.
+    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:debateQ,max_tokens:600},{gridEl,signal:_activeAbortController?.signal});
     const responses=collected.advisors.map(name=>{
       const r=collected.responses[name]||{};
       const info=AC[name]||{};
       return {name,role:info.role||'',color:info.color||'#888',response:r.content||''};
     });
     boardConversation.push({question:debateQ,synthesis:'',responses,target_advisor:null});
+    if(collected.stopped)toast('Stopped — kept whatever finished','ok');
   }catch(e){
-    toast('Debate round failed: '+e.message,'err');
+    if(e.name!=='AbortError')toast('Debate round failed: '+e.message,'err');
   }
 }
 
@@ -1312,11 +1341,15 @@ async function runDebateRound(){
 async function runDebate(){
   const q=document.getElementById('qin').value.trim();if(!q)return;
   const b=document.getElementById('bddb');b.disabled=true;b.textContent='Debating...';
+  const signal=_startStoppable();
   document.getElementById('bdspin').classList.add('on');
   document.getElementById('bdspin').querySelector('.bspin-l').textContent='Two advisors are arguing this out';
   document.getElementById('bdr').style.display='none';document.getElementById('bderr').classList.remove('on');
   try{
-    const res=await fetch('/api/board/debate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+    // Not streamed — the whole result lands in one response at the end, so
+    // Stop here just abandons the wait (nothing partial to keep, unlike the
+    // streaming board path where tokens already rendered stay on screen).
+    const res=await fetch('/api/board/debate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q}),signal});
     const data=await res.json();
     if(data.error)throw new Error(data.error);
     curSessId=data.session_id;
@@ -1349,13 +1382,18 @@ async function runDebate(){
     _populateTargetAdvisorSelect(data.advisors);
     loadRecs();
   }catch(e){
-    const el=document.getElementById('bderr');el.textContent='Error: '+e.message;el.classList.add('on');
-    toast('Debate failed: '+e.message,'err');
+    if(e.name==='AbortError'){
+      toast('Stopped — the board may still finish server-side, check History later','ok');
+    }else{
+      const el=document.getElementById('bderr');el.textContent='Error: '+e.message;el.classList.add('on');
+      toast('Debate failed: '+e.message,'err');
+    }
   }
   finally{
     b.disabled=false;b.textContent='⚔ Debate Mode';
     document.getElementById('bdspin').classList.remove('on');
     document.getElementById('bdspin').querySelector('.bspin-l').textContent='Routing to the right advisors';
+    _endStoppable();
   }
 }
 
@@ -1783,8 +1821,18 @@ async function loadHistory(){
   const ss=await fetch('/api/sessions').then(r=>r.json()).catch(()=>[]);
   const list=document.getElementById('hisl');
   if(!ss.length){list.innerHTML='<div class="empty">No sessions yet.</div>';return;}
-  list.innerHTML=ss.map(s=>`<div class="hi" onclick="loadSess('${s.id}')"><div class="hdt">${new Date(s.timestamp).toLocaleString()}</div><div class="hq">${esc(s.question)}</div></div>`).join('');
+  list.innerHTML=ss.map(s=>`<div class="hi" style="position:relative;padding-right:36px" onclick="loadSess('${s.id}')">
+      <button class="xb" style="position:absolute;top:8px;right:8px" onclick="event.stopPropagation();delSess(this,'${s.id}')">×</button>
+      <div class="hdt">${new Date(s.timestamp).toLocaleString()}</div><div class="hq">${esc(s.question)}</div>
+    </div>`).join('');
   loadKB();
+}
+async function delSess(btn,id){
+  _confirmTap(btn,async()=>{
+    await fetch(`/api/sessions/${id}`,{method:'DELETE'});
+    toast('Session deleted','ok');
+    loadHistory();
+  });
 }
 async function loadSess(id){
   const d=await fetch(`/api/sessions/${id}`).then(r=>r.json());
@@ -1838,23 +1886,29 @@ async function post(url,body,opts={}){
 // Consumes a POST endpoint that streams Server-Sent Events (used for board
 // sessions, which take too long for a plain blocking fetch). onEvent(evt)
 // fires per SSE frame; no timeout here since board sessions legitimately run 1-2 min.
-async function streamSSE(url,body,onEvent){
-  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+async function streamSSE(url,body,onEvent,signal){
+  const r=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body),signal});
   if(!r.ok){let msg=`Request failed (${r.status})`;try{const j=await r.json();if(j.error)msg=j.error;}catch(_){}throw new Error(msg);}
   const reader=r.body.getReader();
   const decoder=new TextDecoder();
   let buf='';
-  while(true){
-    const {done,value}=await reader.read();
-    if(done)break;
-    buf+=decoder.decode(value,{stream:true});
-    const frames=buf.split('\n\n');
-    buf=frames.pop(); // last (possibly incomplete) frame stays in the buffer
-    for(const frame of frames){
-      const line=frame.split('\n').find(l=>l.startsWith('data: '));
-      if(!line)continue;
-      try{onEvent(JSON.parse(line.slice(6)));}catch(_){}
+  try{
+    while(true){
+      const {done,value}=await reader.read();
+      if(done)break;
+      buf+=decoder.decode(value,{stream:true});
+      const frames=buf.split('\n\n');
+      buf=frames.pop(); // last (possibly incomplete) frame stays in the buffer
+      for(const frame of frames){
+        const line=frame.split('\n').find(l=>l.startsWith('data: '));
+        if(!line)continue;
+        try{onEvent(JSON.parse(line.slice(6)));}catch(_){}
+      }
     }
+  }finally{
+    // Closing the reader on abort tells the browser to drop the connection —
+    // the Flask side notices on its next write and its generator unwinds.
+    try{reader.cancel();}catch(_){}
   }
 }
 

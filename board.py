@@ -622,6 +622,26 @@ def list_sessions():
     return sessions
 
 
+def delete_session(session_id):
+    """Delete a session file and any recommendations tied to it — the two are
+    always created together (run_board_async / run_debate_async), so a session
+    the user removes shouldn't leave orphaned recs behind."""
+    # session_id comes straight from a URL path segment; it's a timestamp-format
+    # string (YYYYMMDD_HHMMSS) by construction, but never trust that when it's
+    # about to be interpolated into a filesystem path.
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', session_id):
+        return False
+    path = SESSIONS_DIR / f"{session_id}.json"
+    if not path.exists():
+        return False
+    path.unlink()
+    recs = _load_recs()
+    filtered = [r for r in recs if r.get("session_id") != session_id]
+    if len(filtered) != len(recs):
+        _save_recs(filtered)
+    return True
+
+
 def get_session(session_id):
     path = SESSIONS_DIR / f"{session_id}.json"
     if path.exists():
