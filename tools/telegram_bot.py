@@ -188,10 +188,16 @@ async def _handle_evening(chat_id):
         await _handle_log_flow(chat_id, "/evening", then_evening=True)
 
 
+# Chat_id -> last session_id, so /ask knows which session a follow-up belongs to
+# without the user having to repeat context. Single-user bot, module dict is fine.
+_last_session = {}
+
+
 async def _handle_board_question(chat_id, question):
     send("Convening the board...", chat_id)
     try:
         result = await board_mod.run_board_async(question)
+        _last_session[chat_id] = result["session_id"]
         for r in result["responses"]:
             send(f"*{r['name']}* ({r['role']}):\n{r['response']}", chat_id)
         if result.get("synthesis"):
@@ -200,12 +206,60 @@ async def _handle_board_question(chat_id, question):
         send(f"Board session failed: {e}", chat_id)
 
 
+async def _handle_debate_question(chat_id, question):
+    send("Two advisors are arguing this out (takes a bit longer)...", chat_id)
+    try:
+        result = await board_mod.run_debate_async(question)
+        _last_session[chat_id] = result["session_id"]
+        dbt = result["debate"]
+        for d in (dbt["debater_a"], dbt["debater_b"]):
+            send(f"*{d['name']}* ({d['role']}):\n{d['opening']}\n\n_Rebuttal:_ {d['rebuttal']}", chat_id)
+        send(f"*Judge — {dbt['judge']['name']}:*\n{dbt['judge']['verdict']}", chat_id)
+    except Exception as e:
+        send(f"Debate failed: {e}", chat_id)
+
+
 async def _handle_quick_question(chat_id, question):
     try:
         result = await board_mod.get_quick_response(question)
         send(f"*{result['advisor']}*: {result['response']}", chat_id)
     except Exception as e:
         send(f"Couldn't get an answer: {e}", chat_id)
+
+
+async def _handle_ask_followup(chat_id, question):
+    session_id = _last_session.get(chat_id)
+    if not session_id:
+        send("No active board session to follow up on — start one with /board or /debate first.", chat_id)
+        return
+    try:
+        result = await board_mod.run_followup_async(session_id, question)
+        for r in result.get("responses", []):
+            send(f"*{r['name']}*: {r['response']}", chat_id)
+    except Exception as e:
+        send(f"Follow-up failed: {e}", chat_id)
+
+
+def _handle_scan(chat_id):
+    async def _run():
+        try:
+            import app as app_mod
+            result = await app_mod._generate_opportunity_scan()
+            send(result, chat_id)
+        except Exception as e:
+            send(f"Scan failed: {e}", chat_id)
+    return _run()
+
+
+def _handle_retro(chat_id):
+    async def _run():
+        try:
+            import app as app_mod
+            result = await app_mod._generate_retrospective()
+            send(result, chat_id)
+        except Exception as e:
+            send(f"Retrospective failed: {e}", chat_id)
+    return _run()
 
 
 def _handle_recs(chat_id):
@@ -304,6 +358,10 @@ async def _handle_update(update):
 
     if text.startswith("/board "):
         await _handle_board_question(chat_id, text[len("/board "):].strip())
+    elif text.startswith("/debate "):
+        await _handle_debate_question(chat_id, text[len("/debate "):].strip())
+    elif text.startswith("/ask "):
+        await _handle_ask_followup(chat_id, text[len("/ask "):].strip())
     elif text == "/log":
         await _handle_log_flow(chat_id, text)
     elif text == "/evening":
@@ -312,10 +370,33 @@ async def _handle_update(update):
         _handle_brief(chat_id)
     elif text == "/recs":
         _handle_recs(chat_id)
+    elif text == "/scan":
+        await _handle_scan(chat_id)
+    elif text == "/retro":
+        await _handle_retro(chat_id)
+    elif text == "/approveprofile":
+        _handle_profile_decision(chat_id, approve=True)
+    elif text == "/rejectprofile":
+        _handle_profile_decision(chat_id, approve=False)
     elif text == "/start":
-        send("Command center bot online. /log to log your day, /evening for tonight's brief, /board <question> for the full board, /brief for this morning's brief, /recs for pending recommendations. Or just talk to me.", chat_id)
+        send("Command center bot online. /log to log your day, /evening for tonight's brief, /board <question> for the full board, /debate <question> for two advisors to argue it out, /ask <followup> to continue the last session, /brief for this morning's brief, /recs for pending recommendations, /scan for opportunities, /retro for a weekly retrospective. Or just talk to me.", chat_id)
     else:
         await _route_text(chat_id, text)
+
+
+def _handle_profile_decision(chat_id, approve):
+    proposal_path = DATA_DIR / "profile_proposal.json"
+    if not proposal_path.exists():
+        send("No pending profile update.", chat_id)
+        return
+    proposal = json.loads(proposal_path.read_text())
+    if approve:
+        profile_path = Path(__file__).parent.parent / "profile.md"
+        profile_path.write_text(proposal["updated_profile"])
+        send(f"Profile updated: {proposal.get('diff_summary','')}", chat_id)
+    else:
+        send("Profile update dismissed. Kept as-is.", chat_id)
+    proposal_path.unlink()
 
 
 async def poll_loop():
@@ -375,6 +456,20 @@ def push_unlogged_nag():
     today = date.today().isoformat()
     if not any(l.get("date") == today for l in logs):
         send("You haven't logged today yet. Send /evening to log it now and get tonight's brief.")
+
+
+def push_evening_brief():
+    """21:45 cron — if today's already logged, push the evening brief straight to
+    Telegram instead of waiting for /evening to be sent manually. If not logged yet,
+    the 21:30 unlogged-nag already covers prompting for it."""
+    logs = _load(DAILY_LOG_FILE)
+    today = date.today().isoformat()
+    if not any(l.get("date") == today for l in logs):
+        return
+    try:
+        _send_evening_brief(None)
+    except Exception as e:
+        print(f"[telegram_bot] push_evening_brief failed: {e}")
 
 
 def push_decision_reviews():

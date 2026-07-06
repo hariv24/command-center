@@ -303,7 +303,9 @@ def format_story_for_prompt(story, category, desc):
 
 async def analyze_story(story, category, category_desc, story_idx, profile="", goal_match=False):
     story_text = format_story_for_prompt(story, category, category_desc)
-    profile_ctx = profile[:400] if profile else "An ambitious founder building toward a big goal."
+    # Heavy tier, 1M context window, per-request billing — no reason to truncate
+    # the profile to a sliver when the whole thing costs nothing extra to include.
+    profile_ctx = profile if profile else "An ambitious founder building toward a big goal."
     goal_note = (
         "\nThis story was surfaced specifically because it matches one of the founder's active goals "
         "or open pipeline deals — make the 'Direct implications' section concrete about which goal/deal "
@@ -352,7 +354,7 @@ async def generate_board_verdict(story_map, profile):
         f"- [{cat}] {s['title']} ({s['source']}, {s['score']} pts)"
         for cat, s in story_map.items()
     )
-    prompt = f"""Founder profile: {profile[:600]}
+    prompt = f"""Founder profile: {profile}
 
 Today's 7 intelligence stories they just read:
 {stories_summary}

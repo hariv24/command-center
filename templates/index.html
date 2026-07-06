@@ -473,6 +473,25 @@ select option{background:var(--s2)}
     </div>
   </div>
 
+  <div id="qbetCard" style="display:none;background:var(--s2);border:1px solid var(--h1);border-left:3px solid var(--violet);padding:12px 14px;margin-bottom:13px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:5px">
+      <span style="font-size:9px;font-weight:700;letter-spacing:2px;text-transform:uppercase;color:var(--violet)" id="qbetLabel">Quarterly Bet</span>
+      <span style="font-size:10px;color:var(--t3)" id="qbetDays"></span>
+    </div>
+    <div style="font-size:14px;font-weight:600;color:var(--t1);margin-bottom:4px" id="qbetText"></div>
+    <div style="font-size:11px;color:var(--t3)" id="qbetMetric"></div>
+    <div id="qbetVerdict" style="font-size:11px;color:var(--t2);margin-top:7px;padding-top:7px;border-top:1px solid var(--h1);display:none"></div>
+  </div>
+  <div id="qbetSetCard" style="display:none;background:var(--s2);border:1px solid var(--h1);padding:12px 14px;margin-bottom:13px">
+    <div class="slabel" style="margin-bottom:6px">Set This Quarter's ONE Bet</div>
+    <input type="text" id="qbetInput" placeholder="The one thing that matters most this quarter" style="width:100%;background:var(--s1);border:1px solid var(--h2);color:var(--t1);padding:8px 10px;font-size:12px;margin-bottom:6px">
+    <div style="display:flex;gap:6px">
+      <input type="text" id="qbetMetricInput" placeholder="Metric (e.g. MRR)" style="flex:1;background:var(--s1);border:1px solid var(--h2);color:var(--t1);padding:8px 10px;font-size:12px">
+      <input type="text" id="qbetTargetInput" placeholder="Target" style="flex:1;background:var(--s1);border:1px solid var(--h2);color:var(--t1);padding:8px 10px;font-size:12px">
+    </div>
+    <button class="btn btn-m sm" onclick="setQuarterlyBet()" style="margin-top:8px">Commit — the board will challenge it</button>
+  </div>
+
   <div class="hg" style="animation:fadeUp .45s cubic-bezier(.16,1,.3,1) .14s both">
     <div>
       <div class="brief card" style="padding:0;margin-bottom:13px">
@@ -512,6 +531,12 @@ select option{background:var(--s2)}
     </div>
     <div class="rstack" style="animation:fadeUp .45s cubic-bezier(.16,1,.3,1) .2s both">
       <div class="stat-row sm-coral" id="pc-m"><div class="st-n" id="pc-mn">—</div><div><div class="st-l">Momentum</div><div class="st-s" id="pc-ms">Log time to see</div></div></div>
+      <div id="energySpark" style="display:none;background:var(--s2);border:1px solid var(--h1);padding:10px 11px;margin-bottom:9px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+          <span class="st-l">Energy — 14 days</span><span id="energySparkVal" style="font-family:var(--fm);font-size:11px;color:var(--t2)"></span>
+        </div>
+        <div id="energySparkSvg"></div>
+      </div>
       <div class="stat-row sm-mint" id="pc-s"><div class="st-n" id="pc-sn">0</div><div><div class="st-l">Log Streak</div><div class="st-s">consecutive days</div></div></div>
       <div class="stat-row sm-gold" id="pc-r"><div class="st-n" id="pc-rn">—</div><div><div class="st-l">Board Recs</div><div class="st-s">pending action</div></div></div>
       <div class="stat-row sm-dim" id="pc-f"><div class="st-n" id="pc-fn">—</div><div><div class="st-l">Follow-ups</div><div class="st-s">overdue</div></div></div>
@@ -591,7 +616,10 @@ select option{background:var(--s2)}
   <label style="display:flex;align-items:center;gap:6px;margin-top:9px;font-size:11px;color:var(--t2);cursor:pointer">
     <input type="checkbox" id="bd-debate" style="cursor:pointer"> Let them debate — one extra round where advisors react to each other
   </label>
-  <button class="btn btn-m" id="bdb" onclick="runBoard()" style="margin-top:9px">Convene the Board</button>
+  <div style="display:flex;gap:8px;margin-top:9px">
+    <button class="btn btn-m" id="bdb" onclick="runBoard()" style="flex:1">Convene the Board</button>
+    <button class="btn bg" id="bddb" onclick="runDebate()" style="flex:1" title="2 advisors argue opposing sides across two rounds, a 3rd judges — structured disagreement, not a group chat">⚔ Debate Mode</button>
+  </div>
   <div class="err" id="bderr"></div>
   <div class="bspin" id="bdspin">
     <div class="bspin-l">Routing to the right advisors</div>
@@ -699,6 +727,8 @@ select option{background:var(--s2)}
       <div class="card" id="opend" style="padding:13px;font-size:12px;color:var(--t3)">Loading...</div>
     </div>
   </div>
+  <div class="slabel" style="margin-top:4px">Decision Calibration</div>
+  <div id="calibfull" class="card" style="padding:13px;margin-bottom:16px;font-size:11px;color:var(--t3)">Log decisions with outcomes to see calibration.</div>
   <div id="dcards"><div class="empty">No decisions yet.</div></div>
   <div id="outmod" style="display:none;margin-top:13px" class="card">
     <div style="padding:15px">
@@ -869,7 +899,54 @@ function go(name,el){
   }
 }
 
+// Minimal inline-SVG sparkline — no chart library needed for a single trend line.
+function spark(values,w,h,color){
+  if(!values||values.length<2)return'';
+  const min=Math.min(...values),max=Math.max(...values),range=(max-min)||1;
+  const step=w/(values.length-1);
+  const pts=values.map((v,i)=>`${(i*step).toFixed(1)},${(h-((v-min)/range)*h).toFixed(1)}`).join(' ');
+  const lastX=((values.length-1)*step).toFixed(1),lastY=(h-((values[values.length-1]-min)/range)*h).toFixed(1);
+  return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" style="overflow:visible">
+    <polyline points="${pts}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="${lastX}" cy="${lastY}" r="2.5" fill="${color}"/>
+  </svg>`;
+}
+async function loadEnergySpark(){
+  const logs=await fetch('/api/daily-log').then(r=>r.json()).catch(()=>[]);
+  const withEnergy=logs.filter(l=>l.energy!=null&&l.energy!=='').sort((a,b)=>a.date.localeCompare(b.date)).slice(-14);
+  if(withEnergy.length<2){document.getElementById('energySpark').style.display='none';return;}
+  const vals=withEnergy.map(l=>parseFloat(l.energy));
+  document.getElementById('energySpark').style.display='block';
+  document.getElementById('energySparkVal').textContent=vals[vals.length-1].toFixed(0)+'/10';
+  document.getElementById('energySparkSvg').innerHTML=spark(vals,220,32,'#e8a020');
+}
+async function loadQuarterlyBet(){
+  const b=await fetch('/api/quarterly-bet').then(r=>r.json()).catch(()=>({}));
+  const hasCurrent=b&&b.bet&&b.is_current;
+  document.getElementById('qbetCard').style.display=hasCurrent?'block':'none';
+  document.getElementById('qbetSetCard').style.display=hasCurrent?'none':'block';
+  if(hasCurrent){
+    document.getElementById('qbetLabel').textContent=`${b.quarter} Bet`;
+    document.getElementById('qbetDays').textContent=`${b.days_left}d left`;
+    document.getElementById('qbetText').textContent=b.bet;
+    document.getElementById('qbetMetric').textContent=b.metric?`Target: ${b.metric} = ${b.target}`:'';
+    const verdictEl=document.getElementById('qbetVerdict');
+    if(b.board_verdict){verdictEl.style.display='block';verdictEl.innerHTML='<b>Board:</b> '+esc(b.board_verdict);}
+    else{verdictEl.style.display='none';}
+  }
+}
+async function setQuarterlyBet(){
+  const bet=document.getElementById('qbetInput').value.trim();if(!bet)return;
+  const metric=document.getElementById('qbetMetricInput').value.trim();
+  const target=document.getElementById('qbetTargetInput').value.trim();
+  await post('/api/quarterly-bet',{bet,metric,target});
+  toast('Bet committed — the board is weighing in','ok');
+  ['qbetInput','qbetMetricInput','qbetTargetInput'].forEach(id=>document.getElementById(id).value='');
+  loadQuarterlyBet();
+}
 async function initHome(){
+  loadEnergySpark();
+  loadQuarterlyBet();
   const d=await fetch('/api/home').then(r=>r.json()).catch(()=>({}));
   const {nyc={days:0,target:''},million={days:0,target:''},billion={days:0,target:''}}=d.countdowns||{};
   countUp(document.getElementById('ns-nyc'),nyc.days||0);
@@ -1217,6 +1294,59 @@ async function runDebateRound(){
   }
 }
 
+// Structured debate: 2 advisors argue opposing sides across 2 rounds, a 3rd
+// judges. Not streamed — 5 sequential heavy calls, so this shows a loading
+// state and renders the full result at once rather than token-by-token.
+async function runDebate(){
+  const q=document.getElementById('qin').value.trim();if(!q)return;
+  const b=document.getElementById('bddb');b.disabled=true;b.textContent='Debating...';
+  document.getElementById('bdspin').classList.add('on');
+  document.getElementById('bdspin').querySelector('.bspin-l').textContent='Two advisors are arguing this out';
+  document.getElementById('bdr').style.display='none';document.getElementById('bderr').classList.remove('on');
+  try{
+    const res=await fetch('/api/board/debate',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({question:q})});
+    const data=await res.json();
+    if(data.error)throw new Error(data.error);
+    curSessId=data.session_id;
+    const dbt=data.debate;
+    document.getElementById('bdr').style.display='block';
+    document.getElementById('bdr').scrollIntoView({behavior:'smooth',block:'start'});
+    document.getElementById('bdmeta').textContent=`Debate · ${new Date().toLocaleString()}`;
+    document.getElementById('bdq').textContent=q;
+    document.getElementById('bdroute').innerHTML=
+      `<span style="letter-spacing:2px;margin-right:5px">DEBATE:</span>`+
+      `<span class="rb" style="color:${dbt.debater_a.color};border-color:${dbt.debater_a.color}44">${esc(dbt.debater_a.name)}</span>`+
+      `<span style="opacity:.5;margin:0 6px">vs</span>`+
+      `<span class="rb" style="color:${dbt.debater_b.color};border-color:${dbt.debater_b.color}44">${esc(dbt.debater_b.name)}</span>`+
+      `<span style="opacity:.5;margin-left:10px">· judged by ${esc(dbt.judge.name)}</span>`;
+    document.getElementById('bdgrid').innerHTML=[dbt.debater_a,dbt.debater_b].map(d=>`
+      <div class="acard" style="border-left-color:${d.color}">
+        <div class="acard-head">${advPhoto(d.name)}<div><div class="aname" style="color:${d.color}">${esc(d.name)}</div><div class="arole">${esc(d.role||'')}</div></div></div>
+        <div style="font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:4px">Opening</div>
+        <div class="atxt" data-role="text">${esc(d.opening)}</div>
+        <div style="font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin:10px 0 4px">Rebuttal</div>
+        <div class="atxt" data-role="text">${esc(d.rebuttal)}</div>
+      </div>`).join('');
+    document.getElementById('bdsynth').innerHTML=
+      `<div style="font-size:9px;letter-spacing:1px;text-transform:uppercase;color:var(--t3);margin-bottom:6px">Judge: ${esc(dbt.judge.name)}</div>`+
+      marked.parse(dbt.judge.verdict||'');
+    document.getElementById('bd-thread').innerHTML='';
+    document.getElementById('bd-fu-input').value='';
+    document.getElementById('bd-fu-err').classList.remove('on');
+    boardConversation=[{question:q,synthesis:dbt.judge.verdict,responses:data.responses,target_advisor:null}];
+    _populateTargetAdvisorSelect(data.advisors);
+    loadRecs();
+  }catch(e){
+    const el=document.getElementById('bderr');el.textContent='Error: '+e.message;el.classList.add('on');
+    toast('Debate failed: '+e.message,'err');
+  }
+  finally{
+    b.disabled=false;b.textContent='⚔ Debate Mode';
+    document.getElementById('bdspin').classList.remove('on');
+    document.getElementById('bdspin').querySelector('.bspin-l').textContent='Routing to the right advisors';
+  }
+}
+
 function _populateTargetAdvisorSelect(advisorNames){
   const sel=document.getElementById('bd-target-adv');
   sel.innerHTML='<option value="">THE BOARD</option>';
@@ -1334,18 +1464,34 @@ async function loadConvictions(){
   const list=document.getElementById('cvlist'),cnt=document.getElementById('cvcount');
   if(cnt)cnt.textContent=cvs.length?cvs.length+' stored':'';
   if(!cvs.length){list.innerHTML='<div class="empty">No convictions extracted yet. Have a training session first.</div>';return;}
-  list.innerHTML=cvs.slice().reverse().map(cv=>`<div class="conv-card">
+  list.innerHTML=cvs.slice().reverse().map(cv=>{
+    const status=cv.status||'active';
+    const statusBadge=status==='validated'?'<span style="font-size:8px;color:var(--mint);font-weight:700;letter-spacing:1px;text-transform:uppercase">✓ validated</span>'
+      :status==='invalidated'?'<span style="font-size:8px;color:var(--red);font-weight:700;letter-spacing:1px;text-transform:uppercase">✗ invalidated</span>':'';
+    const actions=status==='active'?`<div style="display:flex;gap:6px;margin-top:8px">
+        <button class="btn bg sm" onclick="setConvictionStatus('${cv.id}','validated')">Validated</button>
+        <button class="btn bg sm" onclick="setConvictionStatus('${cv.id}','invalidated')">Invalidated</button>
+      </div>`:'';
+    return `<div class="conv-card">
     <div class="conv-del"><button class="xb" onclick="delConviction(this,'${cv.id}')">×</button></div>
     <div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:6px">
       <span class="conv-tag">${esc(cv.category)}</span>
       <span style="font-family:var(--fm);font-size:10px;color:var(--gold)">${cv.strength}/10</span>
       <span style="font-size:9px;color:var(--t3)">${cv.date}</span>
       ${cv.source==='training'?'<span style="font-size:8px;color:var(--coral);font-weight:700;letter-spacing:2px;text-transform:uppercase">from training</span>':''}
+      ${statusBadge}
     </div>
     <div class="conv-thesis">${esc(cv.thesis)}</div>
     <div class="conv-str"><div class="conv-str-fill" style="width:${cv.strength*10}%"></div></div>
     ${cv.your_edge&&cv.your_edge!=='Emerged from conviction training'?`<div style="font-size:11px;color:var(--mint);margin-top:3px">${esc(cv.your_edge)}</div>`:''}
-  </div>`).join('');
+    ${actions}
+  </div>`;
+  }).join('');
+}
+async function setConvictionStatus(id,status){
+  await fetch(`/api/convictions/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({status})});
+  toast(status==='validated'?'Marked validated — added to knowledge base':'Marked invalidated — added to knowledge base','ok');
+  loadConvictions();
 }
 
 async function loadConvTrainHistory(){
@@ -1399,14 +1545,29 @@ function _confirmTap(btn,onConfirm){
 async function delConviction(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/convictions/${id}`,{method:'DELETE'});loadConvictions();});}
 document.getElementById('cvin')?.addEventListener('keydown',e=>{if((e.metaKey||e.ctrlKey)&&e.key==='Enter')sendConvTrain()});
 
+let _briefTypeFilter='intel';
+let _allBriefs=[];
 async function loadIntelHist(){
   const b=await fetch('/api/briefs').then(r=>r.json()).catch(()=>[]);
-  document.getElementById('bpills').innerHTML=b.map(x=>`<span class="pill" onclick="loadBriefDate('${x.date}',this)">${x.date}</span>`).join('')||'<span style="font-size:9px;color:var(--t3)">No saved briefs yet</span>';
+  _allBriefs=b;
+  renderBriefFilters();
 }
-async function loadBriefDate(date,el){
-  document.querySelectorAll('.pill').forEach(p=>p.classList.remove('on'));el?.classList.add('on');
+const _briefTypeLabels={intel:'Intel',morning:'Morning',evening:'Evening',weekly:'Weekly',retro:'Retro'};
+function renderBriefFilters(){
+  const types=[...new Set((_allBriefs||[]).map(x=>x.type))];
+  const filterHtml=types.length>1?`<div style="display:flex;gap:5px;margin-bottom:8px">`+
+    types.map(t=>`<span class="pill${_briefTypeFilter===t?' on':''}" onclick="setBriefFilter('${t}')" style="font-weight:700">${_briefTypeLabels[t]||t}</span>`).join('')+`</div>`:'';
+  const filtered=(_allBriefs||[]).filter(x=>x.type===_briefTypeFilter);
+  document.getElementById('bpillsFilter')?.remove();
+  const bpills=document.getElementById('bpills');
+  bpills.insertAdjacentHTML('beforebegin',`<div id="bpillsFilter">${filterHtml}</div>`);
+  bpills.innerHTML=filtered.map(x=>`<span class="pill" onclick="loadBriefId('${x.id}',this)">${x.date}</span>`).join('')||'<span style="font-size:9px;color:var(--t3)">No saved briefs yet</span>';
+}
+function setBriefFilter(t){_briefTypeFilter=t;renderBriefFilters();}
+async function loadBriefId(id,el){
+  document.querySelectorAll('.pill').forEach(p=>{if(p!==el)p.classList.remove('on')});el?.classList.add('on');
   document.getElementById('ic').classList.remove('on');document.getElementById('isk').classList.add('on');
-  const d=await fetch(`/api/briefs/${date}`).then(r=>r.json()).catch(e=>({error:e.message}));
+  const d=await fetch(`/api/briefs/${id}`).then(r=>r.json()).catch(e=>({error:e.message}));
   document.getElementById('ic').innerHTML=marked.parse(d.content||d.error||'');document.getElementById('ic').classList.add('on');document.getElementById('isk').classList.remove('on');
 }
 // Shared driver for the Intel panel's one-shot generators (scan, retro) —
@@ -1476,7 +1637,7 @@ async function loadGoals(){
     return`<div class="gcard"><div class="gdel"><button class="xb" onclick="delGoal(this,'${g.id}')">×</button></div>
       <div class="gt">${esc(g.title)}</div><div class="gm">${g.category}${dl!=null?` · ${dl>0?dl+'d left':'OVERDUE'}`:''}</div>
       ${tv?`<div class="gtrack"><div class="gfill" style="width:${pct.toFixed(0)}%"></div></div>`:''}
-      <div class="gst">${g.current?`<b>${esc(String(g.current))}</b>`:''} ${g.target?`→ <b>${esc(String(g.target))}</b>`:''}</div>
+      <div class="gst">${g.current?`<b>${esc(String(g.current))}</b>`:''} ${g.target?`→ <b>${esc(String(g.target))}</b>`:''} <span onclick="editGoal('${g.id}','${esc(String(g.current||''))}','${esc(String(g.target||''))}')" style="cursor:pointer;color:var(--t3);font-size:10px;text-decoration:underline">edit</span></div>
       ${g.why?`<div class="gwhy">"${esc(g.why)}"</div>`:''}
     </div>`;}).join('');
   const tl=await fetch('/api/time').then(r=>r.json()).catch(()=>[]);
@@ -1490,6 +1651,12 @@ async function addGoal(){
   ['gt','gcur','gtgt','gwhy'].forEach(id=>document.getElementById(id).value='');loadGoals();
 }
 async function delGoal(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/goals/${id}`,{method:'DELETE'});loadGoals();});}
+async function editGoal(id,curVal,tgtVal){
+  const nc=prompt('Current value:',curVal);if(nc===null)return;
+  const nt=prompt('Target value:',tgtVal);if(nt===null)return;
+  await fetch(`/api/goals/${id}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({current:nc,target:nt})});
+  toast('Goal updated','ok');loadGoals();
+}
 async function parseTime(){
   const txt=document.getElementById('ttxt').value.trim(),dt=document.getElementById('tdate').value;if(!txt)return;
   const b=document.getElementById('tpb');b.disabled=true;b.textContent='Parsing...';
@@ -1501,6 +1668,7 @@ async function parseTime(){
 
 async function loadDecs(){
   const ds=await fetch('/api/decisions').then(r=>r.json()).catch(()=>[]);
+  loadCalibration();
   const op=ds.filter(d=>!d.outcome);
   document.getElementById('opend').innerHTML=op.length?
     op.slice(0,4).map(d=>`<div style="margin-bottom:6px;padding-bottom:6px;border-bottom:1px solid var(--h1)"><div style="font-size:12px;font-weight:600;margin-bottom:2px">${esc(d.decision.slice(0,70))}</div><div style="font-size:10px;color:var(--t3)">${d.date} · ${d.confidence}/10</div></div>`).join('')+
@@ -1528,6 +1696,21 @@ async function saveOutcome(){
   document.getElementById('outmod').style.display='none';document.getElementById('outt').value='';document.getElementById('lessl').value='';loadDecs();
 }
 async function delDec(btn,id){_confirmTap(btn,async()=>{await fetch(`/api/decisions/${id}`,{method:'DELETE'});loadDecs();});}
+async function loadCalibration(){
+  const d=await fetch('/api/home').then(r=>r.json()).catch(()=>({}));
+  const c=d.calibration||{};
+  const el=document.getElementById('calibfull');
+  const buckets=['low','mid','high'].filter(k=>c[k]);
+  if(!buckets.length){el.innerHTML='Log decisions with outcomes to see calibration.';return;}
+  const labels={low:'Low confidence (1-4)',mid:'Mid confidence (5-7)',high:'High confidence (8-10)'};
+  el.innerHTML=buckets.map(k=>{
+    const b=c[k];const good=b.success_rate_pct>=60;
+    return `<div style="display:flex;justify-content:space-between;align-items:center;padding:5px 0;border-bottom:1px solid var(--h1)">
+      <span style="color:var(--t2)">${labels[k]} · ${b.n} decision${b.n>1?'s':''}</span>
+      <span style="font-weight:700;color:${good?'var(--mint)':'var(--red)'}">${b.success_rate_pct}% panned out</span>
+    </div>`;
+  }).join('')+(c.verdict?`<div style="margin-top:8px;color:var(--gold)">${esc(c.verdict)}</div>`:'');
+}
 
 async function loadVitalsHist(){
   const logs=await fetch('/api/vitals/history').then(r=>r.json()).catch(()=>[]);

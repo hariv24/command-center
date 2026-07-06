@@ -561,9 +561,13 @@ def load_profile():
 
 
 def load_knowledge_base():
+    """Fed into every advisor call, heavy tier, per-request billing — the monthly
+    consolidate_knowledge_base() keeps the file itself bounded to ~3500 chars, so
+    this cap only mattered when the KB grew past that; raised well past its actual
+    size so a full monthly cycle never gets clipped mid-consolidation."""
     if KB_PATH.exists():
         kb = KB_PATH.read_text()
-        return kb[-2500:] if len(kb) > 2500 else kb
+        return kb[-8000:] if len(kb) > 8000 else kb
     return ""
 
 
@@ -686,7 +690,9 @@ def _personal_history_section(question):
         from tools.build_personal_rag import retrieve_personal_context
         items = retrieve_personal_context(question, top_k=8)
         if items:
-            lines = "\n".join(f"- [{i.get('date','')}] {i['text'][:300]}" for i in items)
+            # Chunks are stored up to 2000 chars (build_personal_rag.py); heavy tier,
+            # per-request billing — don't clip most of the retrieved chunk away.
+            lines = "\n".join(f"- [{i.get('date','')}] {i['text'][:1200]}" for i in items)
             return f"\n\n## Specific things from your past conversations with him that may be relevant:\n{lines}"
     except Exception:
         pass
@@ -978,6 +984,168 @@ def _load_recs():
 def _save_recs(recs):
     RECS_PATH.parent.mkdir(exist_ok=True)
     RECS_PATH.write_text(json.dumps(recs, indent=2))
+
+
+async def _route_debate(question):
+    """Pick 2 advisors likely to genuinely disagree, plus a 3rd distinct advisor to judge."""
+    advisor_list = "\n".join(f"- {name}: {config['role']}" for name, config in BOARD.items())
+    prompt = f"""Question from founder: "{question}"
+
+Advisors:
+{advisor_list}
+
+Pick 2 advisors most likely to STRONGLY DISAGREE with each other on this question, plus 1 different advisor
+to act as judge (someone not already picked). Return ONLY JSON: {{"debater_a": "Name", "debater_b": "Name", "judge": "Name"}}"""
+    try:
+        text = await call_llm([{"role": "user", "content": prompt}], tier="fast", max_tokens=100, temperature=0.2)
+        match = re.search(r'\{.*\}', text, re.DOTALL)
+        if match:
+            parsed = json.loads(match.group())
+            a, b, j = parsed.get("debater_a"), parsed.get("debater_b"), parsed.get("judge")
+            if a in BOARD and b in BOARD and j in BOARD and len({a, b, j}) == 3:
+                return a, b, j
+    except Exception:
+        pass
+    return "Elon Musk", "Warren Buffett", "Charlie Munger"
+
+
+def _rebuttal_prompt(other_name, other_argument, anchor=""):
+    anchor_line = f"{anchor}\n\n" if anchor else ""
+    return f"""{anchor_line}{other_name} just heard the same question and argued:
+"{other_argument[:1200]}"
+
+Respond directly to their argument. Where are they wrong? Where do you actually agree despite the framing?
+Defend your position or refine it — don't just repeat your first answer. 2-3 sentences on the rebuttal itself,
+then restate your recommendation in one sentence."""
+
+
+async def run_debate_async(question):
+    """
+    Two advisors argue opposing sides across two rounds, a third judges. Structured
+    disagreement surfaces the real tension in a decision instead of averaging it away —
+    the same reason multi-agent debate improves reasoning benchmarks: agents correcting
+    each other's blind spots beats one model (or one advisor) reasoning alone.
+    """
+    if not _has_llm_key():
+        raise ValueError("No LLM API key set (OPENROUTER_API_KEY / GROQ_API_KEY) in .env")
+
+    profile = load_profile()
+    debater_a, debater_b, judge_name = await _route_debate(question)
+
+    kb = load_knowledge_base()
+    anchor = ""
+    try:
+        import sys as _sys
+        _sys.path.insert(0, str(Path(__file__).parent))
+        import app as _app
+        anchor = _app._anchor_header()
+        live_ctx = _app._build_live_context()
+        if live_ctx:
+            kb = (kb or "") + f"\n\n[LIVE CONTEXT — {datetime.now().strftime('%Y-%m-%d')}]\n{live_ctx}"
+    except Exception:
+        pass
+
+    # Round 1 — both debaters answer independently, in parallel.
+    (result_a, prompt_a), (result_b, prompt_b) = await asyncio.gather(
+        _get_advisor_response(debater_a, BOARD[debater_a], question, profile, kb, anchor=anchor),
+        _get_advisor_response(debater_b, BOARD[debater_b], question, profile, kb, anchor=anchor),
+    )
+    name_a, role_a, color_a, content_a, model_a = result_a
+    name_b, role_b, color_b, content_b, model_b = result_b
+
+    # Round 2 — each debater rebuts the other's opening argument.
+    messages_a = [
+        {"role": "system", "content": _build_system(debater_a, BOARD[debater_a])},
+        {"role": "user", "content": prompt_a},
+        {"role": "assistant", "content": content_a},
+        {"role": "user", "content": _rebuttal_prompt(debater_b, content_b, anchor=anchor)},
+    ]
+    messages_b = [
+        {"role": "system", "content": _build_system(debater_b, BOARD[debater_b])},
+        {"role": "user", "content": prompt_b},
+        {"role": "assistant", "content": content_b},
+        {"role": "user", "content": _rebuttal_prompt(debater_a, content_a, anchor=anchor)},
+    ]
+    rebuttal_a, rebuttal_b = await asyncio.gather(
+        _ask_advisor(debater_a, BOARD[debater_a], messages_a),
+        _ask_advisor(debater_b, BOARD[debater_b], messages_b),
+    )
+    rebuttal_content_a = rebuttal_a[3]
+    rebuttal_content_b = rebuttal_b[3]
+
+    # Judge — in character, given the full exchange, rules on the debate.
+    judge_config = BOARD[judge_name]
+    judge_prompt = f"""{anchor}
+
+## The person you are advising:
+{profile}
+
+Two other advisors just debated this question:
+"{question}"
+
+{debater_a} opened with:
+"{content_a[:1000]}"
+
+{debater_b} opened with:
+"{content_b[:1000]}"
+
+{debater_a}'s rebuttal:
+"{rebuttal_content_a[:800]}"
+
+{debater_b}'s rebuttal:
+"{rebuttal_content_b[:800]}"
+
+As the judge, rule on this debate in your own voice. Under 250 words:
+1. Who made the stronger case, and why
+2. What both of them missed
+3. The one concrete action to take, with a deadline"""
+    judge_messages = [
+        {"role": "system", "content": _build_system(judge_name, judge_config)},
+        {"role": "user", "content": judge_prompt},
+    ]
+    verdict = (await _ask_advisor(judge_name, judge_config, judge_messages, max_tokens=2000))[3]
+
+    responses = [
+        (debater_a, role_a, color_a, rebuttal_content_a, model_a),
+        (debater_b, role_b, color_b, rebuttal_content_b, model_b),
+    ]
+    threads = {
+        debater_a: messages_a + [{"role": "assistant", "content": rebuttal_content_a}],
+        debater_b: messages_b + [{"role": "assistant", "content": rebuttal_content_b}],
+    }
+    session_id = save_session(
+        question, responses, verdict,
+        advisors=[debater_a, debater_b, judge_name],
+        advisor_reasons={debater_a: "debater", debater_b: "debater", judge_name: "judge"},
+        threads=threads,
+    )
+
+    await asyncio.gather(
+        _update_knowledge_base(question, verdict),
+        _extract_recommendations(session_id, question, verdict, [debater_a, debater_b, judge_name]),
+        _update_advisor_memory([debater_a, debater_b, judge_name]),
+        _generate_session_title(session_id, question),
+        _index_personal_rag(),
+        return_exceptions=True,
+    )
+
+    return {
+        "session_id": session_id,
+        "timestamp": datetime.now().isoformat(),
+        "question": question,
+        "mode": "debate",
+        "advisors": [debater_a, debater_b, judge_name],
+        "debate": {
+            "debater_a": {"name": debater_a, "role": role_a, "color": color_a, "opening": content_a, "rebuttal": rebuttal_content_a},
+            "debater_b": {"name": debater_b, "role": role_b, "color": color_b, "opening": content_b, "rebuttal": rebuttal_content_b},
+            "judge": {"name": judge_name, "role": judge_config["role"], "color": judge_config["color"], "verdict": verdict},
+        },
+        "responses": [
+            {"name": n, "role": r, "color": c, "response": resp, "model": model}
+            for n, r, c, resp, model in responses
+        ] + [{"name": judge_name, "role": judge_config["role"], "color": judge_config["color"], "response": verdict, "model": "judge"}],
+        "synthesis": verdict,
+    }
 
 
 async def run_board_async(question):
@@ -1574,3 +1742,7 @@ Answer in 80-120 words max. Direct, sharp, specific to this person's situation. 
 
 def run_board(question):
     return asyncio.run(run_board_async(question))
+
+
+def run_debate(question):
+    return asyncio.run(run_debate_async(question))

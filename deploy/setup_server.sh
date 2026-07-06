@@ -109,7 +109,7 @@ sudo sed -i 's/--workers 2 --timeout 180/--workers 2 --threads 4 --timeout 180/'
 sudo systemctl daemon-reload
 sudo systemctl restart commandcenter
 
-echo "== 7/7: cron jobs (intel, morning brief, Telegram pushes, weekly, KB consolidation) =="
+echo "== 7/7: cron jobs (intel, briefs, Telegram pushes, weekly, memory, anticipation, quarterly bet) =="
 CRON_MARKER="# commandcenter-cron"
 # `|| true` matters: on a fresh box with no existing crontab, `grep -v` finds
 # nothing to filter and exits 1 — under `set -e` that would kill this subshell
@@ -118,13 +118,17 @@ CRON_MARKER="# commandcenter-cron"
 0 5 * * * curl -s -X POST http://localhost:4000/api/cron/intel $CRON_MARKER
 30 5 * * * curl -s -X POST http://localhost:4000/api/cron/morning $CRON_MARKER
 0 6 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_morning_brief $CRON_MARKER
+45 8 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/anticipate.py $CRON_MARKER
+0 9 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_aging_recommendations $CRON_MARKER
+5 9 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_decision_reviews $CRON_MARKER
 30 21 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_unlogged_nag $CRON_MARKER
+45 21 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_evening_brief $CRON_MARKER
+30 22 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/memory_reflect.py $CRON_MARKER
 0 8 * * 0 curl -s -X POST http://localhost:4000/api/cron/weekly $CRON_MARKER
 5 8 * * 0 ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_weekly_synthesis $CRON_MARKER
 0 20 * * 0 curl -s -X POST http://localhost:4000/api/cron/auto-board $CRON_MARKER
-0 9 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_aging_recommendations $CRON_MARKER
-5 9 * * * ${APP_DIR}/venv/bin/python ${APP_DIR}/tools/telegram_bot.py push_decision_reviews $CRON_MARKER
 0 3 1 * * curl -s -X POST http://localhost:4000/api/cron/kb-consolidate $CRON_MARKER
+0 8 1 1,4,7,10 * curl -s -X POST http://localhost:4000/api/cron/quarter-end $CRON_MARKER
 EOF
 ) | crontab -
 

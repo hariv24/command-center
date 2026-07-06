@@ -19,7 +19,7 @@ from dotenv import load_dotenv
 load_dotenv(Path(__file__).parent / ".env")
 
 sys.path.insert(0, str(Path(__file__).parent))
-from board import run_board, list_sessions, get_session, get_quick_response, _load_recs, _save_recs, run_followup_async, run_board_stream, run_followup_stream
+from board import run_board, run_debate, list_sessions, get_session, get_quick_response, _load_recs, _save_recs, run_followup_async, run_board_stream, run_followup_stream
 from llm import call_llm
 from tools.daily_brief import run_daily_brief_async
 
@@ -189,7 +189,7 @@ def _build_live_context(include_goals=True, include_decisions=True,
     # Wellness state — synthesized from coaching conversations
     wb = load_json(WELLNESS_BRIEF_FILE) if WELLNESS_BRIEF_FILE.exists() else {}
     if isinstance(wb, dict) and wb.get("content"):
-        parts.append(f"WELLNESS STATE (updated {wb.get('date','')}):\n{wb['content'][:500]}")
+        parts.append(f"WELLNESS STATE (updated {wb.get('date','')}):\n{wb['content']}")
 
     # Active convictions — what he claims to believe
     convictions = load_json(CONVICTIONS_FILE)
@@ -292,6 +292,11 @@ def _anchor_header():
         if scoreboard["broken"] > 0:
             lines.append(f"Broken commitments: {scoreboard['broken']}")
 
+    bet = load_json(QUARTERLY_BET_FILE) if QUARTERLY_BET_FILE.exists() else {}
+    if isinstance(bet, dict) and bet.get("bet") and bet.get("quarter") == _current_quarter():
+        bet_days_left = max((_quarter_end_date(bet["quarter"]) - today).days, 0)
+        lines.append(f"Quarterly bet ({bet['quarter']}, {bet_days_left}d left): {bet['bet'][:100]}")
+
     if not lines:
         return ""
     return "[STATE: " + " · ".join(lines) + "]"
@@ -302,6 +307,26 @@ NORTH_STAR = {
     "million": {"label": "$1M",           "target": "2032-01-01", "age": 29, "what": "Agency scaled with hires, you're doing high-level only, $1M in the bank."},
     "billion": {"label": "$1B",           "target": "2042-01-01", "age": 39, "what": "Startup built from 2029, funded, scaled. Gulfstream G650. Real target is 39-40, not 45."},
 }
+
+QUARTERLY_BET_FILE = DATA_DIR / "quarterly_bet.json"
+
+
+def _current_quarter():
+    from datetime import date
+    today = date.today()
+    q = (today.month - 1) // 3 + 1
+    return f"{today.year}-Q{q}"
+
+
+def _quarter_end_date(quarter_label):
+    """quarter_label like '2026-Q3' -> last calendar day of that quarter."""
+    from datetime import date
+    import calendar
+    year, q = quarter_label.split("-Q")
+    year, q = int(year), int(q)
+    end_month = q * 3
+    last_day = calendar.monthrange(year, end_month)[1]
+    return date(year, end_month, last_day)
 
 
 def _seed_goals():
@@ -453,6 +478,25 @@ def quick_board():
         return jsonify({"error": _friendly_error(e)}), 500
 
 
+@app.route("/api/board/debate", methods=["POST"])
+@requires_auth
+def board_debate():
+    """
+    Two advisors argue opposing sides, a third judges — not streamed (5 heavy
+    calls across 3 sequential rounds), so the UI shows a loading state and
+    waits for the full result rather than token-by-token like /api/board/stream.
+    """
+    data = request.get_json()
+    question = data.get("question", "").strip()
+    if not question:
+        return jsonify({"error": "Question is required"}), 400
+    try:
+        result = run_debate(question)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": _friendly_error(e)}), 500
+
+
 @app.route("/api/recommendations", methods=["GET"])
 @requires_auth
 def get_recommendations():
@@ -510,20 +554,34 @@ def brief_poll():
 @requires_auth
 def list_briefs():
     import re
+    PREFIXES = {"morning_": "morning", "evening_": "evening", "weekly_": "weekly", "retro_": "retro"}
     briefs = []
     for f in sorted(BRIEFS_DIR.glob("*.md"), reverse=True):
-        if re.match(r'^\d{4}-\d{2}-\d{2}$', f.stem):  # only YYYY-MM-DD intel briefs
-            briefs.append({"date": f.stem, "filename": f.name})
+        stem = f.stem
+        matched_type = "intel" if re.match(r'^\d{4}-\d{2}-\d{2}$', stem) else None
+        date_part = stem
+        for prefix, kind in PREFIXES.items():
+            if stem.startswith(prefix):
+                matched_type = kind
+                date_part = stem[len(prefix):]
+                break
+        if matched_type:
+            briefs.append({"id": stem, "date": date_part, "type": matched_type})
     return jsonify(briefs)
 
 
-@app.route("/api/briefs/<date>", methods=["GET"])
+@app.route("/api/briefs/<brief_id>", methods=["GET"])
 @requires_auth
-def get_brief(date):
-    path = BRIEFS_DIR / f"{date}.md"
+def get_brief(brief_id):
+    # brief_id is the file stem (e.g. "2026-07-06" for intel, "morning_2026-07-06" for
+    # morning briefs) — kept as a single opaque id rather than reconstructing type+date
+    # so one route serves every brief type without guessing a filename pattern.
+    if not re.match(r'^[a-zA-Z0-9_\-]+$', brief_id):
+        return jsonify({"error": "Invalid brief id"}), 400
+    path = BRIEFS_DIR / f"{brief_id}.md"
     if not path.exists():
         return jsonify({"error": "Brief not found"}), 404
-    return jsonify({"date": date, "content": path.read_text()})
+    return jsonify({"id": brief_id, "content": path.read_text()})
 
 
 @app.route("/api/sessions", methods=["GET"])
@@ -894,12 +952,13 @@ def vitals_chat():
 
     vitals = load_json(VITALS_FILE)
 
-    # Build context from recent check-ins for the coach's memory
-    recent = vitals[-10:] if len(vitals) > 10 else vitals
+    # Build context from recent check-ins for the coach's memory — heavy tier,
+    # full exchanges cost nothing extra and give real continuity across sessions.
+    recent = vitals[-20:] if len(vitals) > 20 else vitals
     memory_lines = []
     for v in recent:
-        memory_lines.append(f"[{v['date']}] You: {v['user'][:200]}\nMe: {v['coach'][:200]}")
-    memory_context = "\n\n".join(memory_lines[-5:])
+        memory_lines.append(f"[{v['date']}] You: {v['user']}\nMe: {v['coach']}")
+    memory_context = "\n\n".join(memory_lines[-12:])
 
     # --- Cross-module context: everything the future-self should already know ---
     from datetime import date, timedelta
@@ -1104,6 +1163,63 @@ def delete_goal(goal_id):
     goals = [g for g in load_json(GOALS_FILE) if g["id"] != goal_id]
     save_json(GOALS_FILE, goals)
     return jsonify({"ok": True})
+
+
+# ── Quarterly Bet ──────────────────────────────────────────────
+# One big bet per quarter, not five — the highest-leverage solo-founder pattern:
+# focus compounds, and an unchallenged bet is just a wish. The board argues it
+# on commit, every morning brief opens with days-remaining, and it gets judged
+# at quarter-end instead of quietly forgotten.
+@app.route("/api/quarterly-bet", methods=["GET"])
+@requires_auth
+def get_quarterly_bet():
+    from datetime import date
+    bet = load_json(QUARTERLY_BET_FILE) if QUARTERLY_BET_FILE.exists() else {}
+    if not isinstance(bet, dict) or not bet:
+        return jsonify({})
+    quarter = bet.get("quarter", _current_quarter())
+    days_left = (_quarter_end_date(quarter) - date.today()).days
+    return jsonify({**bet, "days_left": max(days_left, 0), "is_current": quarter == _current_quarter()})
+
+
+@app.route("/api/quarterly-bet", methods=["POST"])
+@requires_auth
+def set_quarterly_bet():
+    import threading
+    d = request.get_json()
+    bet_text = d.get("bet", "").strip()
+    if not bet_text:
+        return jsonify({"error": "bet required"}), 400
+    quarter = _current_quarter()
+    entry = {
+        "quarter": quarter,
+        "bet": bet_text,
+        "why": d.get("why", ""),
+        "metric": d.get("metric", ""),
+        "target": d.get("target", ""),
+        "set_date": datetime.now().strftime("%Y-%m-%d"),
+        "board_verdict": "",
+        "outcome": None,
+    }
+    save_json(QUARTERLY_BET_FILE, entry)
+
+    def _run():
+        try:
+            question = (
+                f"Hariv just committed to ONE quarterly bet for {quarter}: \"{bet_text}\" "
+                f"(why: {d.get('why', '')}, target metric: {d.get('metric', '')} = {d.get('target', '')}). "
+                "Challenge this bet directly — is it the highest-leverage thing he could commit to this "
+                "quarter, or is he avoiding something harder? Give a verdict: back it, or push back with "
+                "what he should commit to instead. Under 200 words."
+            )
+            result = run_board(question)
+            entry["board_verdict"] = result.get("synthesis", "")
+            save_json(QUARTERLY_BET_FILE, entry)
+        except Exception as e:
+            print(f"[QUARTERLY BET] board challenge failed: {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify(entry)
 
 
 # ── Decision Journal ───────────────────────────────────────────
@@ -1483,13 +1599,10 @@ def update_kb():
 
 
 # ── Weekly Retrospective ───────────────────────────────────────
-@app.route("/api/retrospective", methods=["POST"])
-@requires_auth
-def retrospective():
-    import asyncio as _asyncio
+async def _generate_retrospective():
+    """Shared by the /api/retrospective route and the Telegram /retro command."""
     from datetime import date, timedelta
 
-    # Gather this week's data
     today = date.today()
     monday = today - timedelta(days=today.weekday())
 
@@ -1528,8 +1641,7 @@ DECISIONS MADE ({len(decisions)}):
 VITALS CHECK-INS ({len(vitals_this_week)}):
 {chr(10).join(v.get("user", "")[:150] for v in vitals_this_week[:5])}"""
 
-    async def _generate():
-        prompt = f"""Write a weekly retrospective for Hariv — 23-year-old Indian founder, goal: NYC, billionaire. Be direct. No filler.
+    prompt = f"""Write a weekly retrospective for Hariv — 23-year-old Indian founder, goal: NYC, billionaire. Be direct. No filler.
 
 {context}
 
@@ -1555,28 +1667,30 @@ Structure:
 
 Be specific. Reference actual numbers and decisions from the data. Under 400 words."""
 
-        return await call_llm(
-            [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=2800, temperature=0.7
-        )
+    result = await call_llm(
+        [{"role": "user", "content": prompt}],
+        tier="heavy", max_tokens=2800, temperature=0.7
+    )
+    retro_path = BRIEFS_DIR / f"retro_{today.isoformat()}.md"
+    retro_path.write_text(f"# Weekly Retrospective — {monday.isoformat()} to {today.isoformat()}\n\n{result}")
+    return result
 
+
+@app.route("/api/retrospective", methods=["POST"])
+@requires_auth
+def retrospective():
+    import asyncio as _asyncio
     try:
-        result = _asyncio.run(_generate())
-        # Save retrospective to briefs dir
-        retro_path = BRIEFS_DIR / f"retro_{today.isoformat()}.md"
-        retro_path.write_text(f"# Weekly Retrospective — {monday.isoformat()} to {today.isoformat()}\n\n{result}")
+        result = _asyncio.run(_generate_retrospective())
         return jsonify({"retro": result})
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
 
 
 # ── Opportunity Scanner ────────────────────────────────────────
-@app.route("/api/scan", methods=["POST"])
-@requires_auth
-def opportunity_scan():
-    """Scan for specific opportunities relevant to Hariv's businesses."""
-    import asyncio as _asyncio
-    from tools.daily_brief import fetch_hn_stories, fetch_reddit_posts_with_comments, is_relevant
+async def _generate_opportunity_scan():
+    """Shared by the /api/scan route and the Telegram /scan command."""
+    from tools.daily_brief import fetch_hn_stories, fetch_reddit_posts_with_comments
 
     SCAN_TOPICS = [
         "vertical SaaS India", "manufacturing software India", "ERP automation India",
@@ -1587,31 +1701,30 @@ def opportunity_scan():
         "B2B SaaS go-to-market India", "outreach automation"
     ]
 
-    async def _scan():
-        hn = fetch_hn_stories(50)
-        reddit = []
-        for sub in ["SaaS", "startups", "indianstartups", "entrepreneur"]:
-            reddit.extend(fetch_reddit_posts_with_comments(sub, 8))
+    hn = fetch_hn_stories(50)
+    reddit = []
+    for sub in ["SaaS", "startups", "indianstartups", "entrepreneur"]:
+        reddit.extend(fetch_reddit_posts_with_comments(sub, 8))
 
-        all_stories = hn + reddit
-        relevant = []
-        for s in all_stories:
-            combined = (s["title"] + " " + s.get("selftext", "")).lower()
-            if any(t.lower() in combined for t in SCAN_TOPICS):
-                relevant.append(s)
+    all_stories = hn + reddit
+    relevant = []
+    for s in all_stories:
+        combined = (s["title"] + " " + s.get("selftext", "")).lower()
+        if any(t.lower() in combined for t in SCAN_TOPICS):
+            relevant.append(s)
 
-        relevant.sort(key=lambda x: x["score"], reverse=True)
-        relevant = relevant[:8]
+    relevant.sort(key=lambda x: x["score"], reverse=True)
+    relevant = relevant[:8]
 
-        if not relevant:
-            return "No specific opportunities surfaced today. Check again tomorrow."
+    if not relevant:
+        return "No specific opportunities surfaced today. Check again tomorrow."
 
-        stories_text = "\n\n".join(
-            f"- {s['title']} ({s['source']}, score:{s['score']})\n  URL: {s['url']}"
-            for s in relevant
-        )
+    stories_text = "\n\n".join(
+        f"- {s['title']} ({s['source']}, score:{s['score']})\n  URL: {s['url']}"
+        for s in relevant
+    )
 
-        prompt = f"""Hariv is a 23-year-old Indian founder building:
+    prompt = f"""Hariv is a 23-year-old Indian founder building:
 1. Automation agency (current client: Shakti Electricals, a transformer manufacturer)
 2. TENANTZA — rental management SaaS
 3. Planning: vertical AI SaaS for Indian manufacturing/SMB sector
@@ -1636,13 +1749,18 @@ Write a SHORT opportunity scan report:
 
 Be specific. Under 300 words."""
 
-        return await call_llm(
-            [{"role": "user", "content": prompt}],
-            tier="heavy", max_tokens=2400, temperature=0.7
-        )
+    return await call_llm(
+        [{"role": "user", "content": prompt}],
+        tier="heavy", max_tokens=2400, temperature=0.7
+    )
 
+
+@app.route("/api/scan", methods=["POST"])
+@requires_auth
+def opportunity_scan():
+    import asyncio as _asyncio
     try:
-        result = _asyncio.run(_scan())
+        result = _asyncio.run(_generate_opportunity_scan())
         return jsonify({"scan": result})
     except Exception as ex:
         return jsonify({"error": str(ex)}), 500
@@ -1835,6 +1953,38 @@ def cron_kb_consolidate():
     return jsonify({"ok": True, "message": "KB consolidation started"})
 
 
+@app.route("/api/cron/quarter-end", methods=["POST"])
+@requires_localhost
+def cron_quarter_end():
+    """1st of Jan/Apr/Jul/Oct: judge last quarter's bet honestly, then prompt for the next one."""
+    import threading
+    def _run():
+        try:
+            bet = load_json(QUARTERLY_BET_FILE) if QUARTERLY_BET_FILE.exists() else {}
+            if isinstance(bet, dict) and bet.get("bet") and not bet.get("outcome"):
+                question = (
+                    f"Quarter {bet['quarter']} just ended. Hariv's one bet for the quarter was: "
+                    f"\"{bet['bet']}\" (target: {bet.get('metric', '')} = {bet.get('target', '')}). "
+                    "Judge honestly: did this pay off? What's the evidence for or against? "
+                    "One direct paragraph — no hedging."
+                )
+                result = run_board(question)
+                bet["outcome"] = result.get("synthesis", "")
+                save_json(QUARTERLY_BET_FILE, bet)
+                try:
+                    from tools.telegram_bot import send as _tg_send
+                    _tg_send(
+                        f"*Quarter {bet['quarter']} bet retro:*\n\"{bet['bet']}\"\n\n{bet['outcome']}\n\n"
+                        "What's your ONE bet for the new quarter? Set it on the dashboard."
+                    )
+                except Exception as e:
+                    print(f"[QUARTER-END] telegram push failed: {e}")
+        except Exception as e:
+            print(f"[QUARTER-END] failed: {e}")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"ok": True, "message": "Quarter-end retro started"})
+
+
 @app.route("/api/cron/auto-board", methods=["POST"])
 @requires_localhost
 def cron_auto_board():
@@ -1844,19 +1994,27 @@ def cron_auto_board():
     pushes a verdict + next week's priority via Telegram. No prompt needed
     from Hariv; this is the board reaching out instead of waiting to be asked.
     """
-    import threading, asyncio as _asyncio
+    import threading
     def _run():
         try:
             gap = _mrr_gap_for_prompt()
             scoreboard = _commitment_scoreboard_for_prompt()
+            bet = load_json(QUARTERLY_BET_FILE) if QUARTERLY_BET_FILE.exists() else {}
+            bet_line = ""
+            if isinstance(bet, dict) and bet.get("bet") and bet.get("quarter") == _current_quarter():
+                bet_line = f" Quarterly bet in progress: \"{bet['bet']}\" — weigh this week's priority against whether it moves that bet forward."
             question = (
                 "It's Sunday. Review this week on your own initiative: what happened in the pipeline, "
                 "what commitments were kept or broken, and what the MRR gap trajectory looks like. "
-                f"Context: {gap} {scoreboard} "
+                f"Context: {gap} {scoreboard}{bet_line} "
                 "Give a 5-bullet verdict on the week and name ONE priority for next week — the single "
                 "highest-leverage thing, with a concrete deadline."
             )
-            result = _asyncio.run(run_board(question))
+            # run_board() already wraps its own asyncio.run() internally — calling it directly
+            # here (this fired inside a background thread with no event loop, so that's safe)
+            # instead of double-wrapping in another asyncio.run(), which previously raised
+            # "a coroutine was expected" and silently killed the Sunday push every week.
+            result = run_board(question)
             try:
                 from tools.telegram_bot import send as _tg_send
                 lines = [f"*Sunday Board Verdict*"]
@@ -2089,8 +2247,8 @@ def _generate_weekly_synthesis():
     week_expenses = [e for e in expenses if e.get("date", "") >= week_start]
     total_spent = sum(e.get("amount", 0) for e in week_expenses)
 
-    # Knowledge base (latest)
-    kb = KB_PATH.read_text()[-600:] if KB_PATH.exists() else ""
+    # Knowledge base (latest) — heavy tier, no cost to including much more of it
+    kb = KB_PATH.read_text()[-6000:] if KB_PATH.exists() else ""
 
     prompt = f"""You are generating a weekly cross-module synthesis for someone's personal command center. You have access to everything that happened this week across all areas of their life.
 
@@ -2182,13 +2340,15 @@ def _generate_morning_brief():
     for f in sorted(Path(__file__).parent.joinpath("sessions").glob("*.json"), reverse=True)[:3]:
         try:
             s = json.loads(f.read_text())
-            sessions_ctx.append({"q": s["question"][:80], "synthesis": s["synthesis"][:180]})
+            sessions_ctx.append({"q": s["question"][:200], "synthesis": s["synthesis"][:1500]})
         except Exception:
             pass
 
     open_decs = [d for d in load_json(DECISIONS_FILE) if not d.get("outcome")]
     goals = load_json(GOALS_FILE)
-    kb = KB_PATH.read_text()[-800:] if KB_PATH.exists() else ""
+    # Heavy tier, 1M context, per-request billing — several KB of history costs
+    # nothing extra to include and gives the brief far more to actually work with.
+    kb = KB_PATH.read_text()[-6000:] if KB_PATH.exists() else ""
     nyc_days = (date.fromisoformat("2028-01-01") - date.today()).days
 
     # Pull today's intel Board's Verdict (generated at 5am, we run at 5:30am)
@@ -2197,7 +2357,7 @@ def _generate_morning_brief():
     if intel_file.exists():
         raw = intel_file.read_text()
         if "## Board's Verdict" in raw:
-            verdict = raw.split("## Board's Verdict")[-1].strip()[:800]
+            verdict = raw.split("## Board's Verdict")[-1].strip()[:3000]
             intel_signal = f"TODAY'S MACRO SIGNAL (from morning intel):\n{verdict}"
 
     # Unactioned board recommendations
@@ -2247,7 +2407,16 @@ def _generate_morning_brief():
     wellness_ctx = wb.get("content", "No wellness data yet.") if wb else "No wellness data yet."
     wellness_date = wb.get("date", "") if wb else ""
 
+    # Quarterly bet — one big bet, not five; the morning brief keeps it in view every day
+    bet = load_json(QUARTERLY_BET_FILE) if QUARTERLY_BET_FILE.exists() else {}
+    quarterly_bet_line = ""
+    if isinstance(bet, dict) and bet.get("bet") and bet.get("quarter") == _current_quarter():
+        bet_days_left = max((_quarter_end_date(bet["quarter"]) - date.today()).days, 0)
+        quarterly_bet_line = f"QUARTERLY BET ({bet['quarter']}, {bet_days_left} days left): {bet['bet']}"
+
     ctx = f"""Hariv: 23yo Indian founder from Trichy. NYC by Jan 2028 ({nyc_days} days, age 26). $1B by 39-40. Current: automation agency (Shakti Electricals client), TENANTZA SaaS, ₹25k job to quit ASAP.
+
+{quarterly_bet_line}
 
 WELLNESS BRIEF (synthesized from all coaching conversations{f', last updated {wellness_date}' if wellness_date else ''}):
 {wellness_ctx}
@@ -2367,7 +2536,7 @@ def _generate_evening_brief():
     morning_cache = load_json(MORNING_CACHE_FILE) if MORNING_CACHE_FILE.exists() else {}
     morning_content = ""
     if isinstance(morning_cache, dict) and morning_cache.get("date") == today and morning_cache.get("content"):
-        morning_content = morning_cache["content"][:600]
+        morning_content = morning_cache["content"]
 
     # Decisions logged today
     today_decisions = [d for d in load_json(DECISIONS_FILE) if d.get("date") == today]
