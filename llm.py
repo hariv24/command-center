@@ -94,6 +94,33 @@ import re as _re
 
 _THINK_RE = _re.compile(r"<think>.*?</think>\s*", _re.DOTALL)
 
+# Weaker/free reasoning models sometimes narrate the instruction instead of
+# following it ("The user is asking me to react to what X said... Let me
+# analyze...") even when explicitly told not to. Strip any leading paragraph
+# that reads like task-narration rather than an actual answer — iteratively,
+# since some responses stack two or three of these before the real content
+# starts. The length cap keeps this from ever eating a legitimate paragraph
+# that just happens to mention "the user" in passing.
+_NARRATION_MARKERS = (
+    "the user is asking", "the user wants", "the user just",
+    "i need to state", "i need to analyze", "i need to respond", "i need to react",
+    "let me analyze", "let me think", "let me respond", "let me address",
+    "i'll analyze", "i will analyze", "i'll respond to", "i will respond to",
+    "i should respond", "i should analyze", "i should react",
+)
+
+
+def _strip_meta_narration(text):
+    while True:
+        parts = text.split("\n\n", 1)
+        if len(parts) != 2:
+            return text
+        first, rest = parts
+        if len(first) < 400 and any(m in first.lower() for m in _NARRATION_MARKERS):
+            text = rest.lstrip()
+        else:
+            return text
+
 
 async def _try(client, model, messages, max_tokens, temperature, provider_name, openrouter=False, timeout=60):
     kwargs = dict(model=model, messages=messages,
@@ -109,7 +136,12 @@ async def _try(client, model, messages, max_tokens, temperature, provider_name, 
     text = r.choices[0].message.content
     if text:
         text = _THINK_RE.sub("", text)
-    if not text or not text.strip():
+        text = _strip_meta_narration(text)
+    # A response can be technically non-empty but garbage (a model that stops
+    # after emitting a couple of stray markdown characters, e.g. "**") — treat
+    # anything under 15 real characters the same as empty so it falls through
+    # to the next model in the chain instead of shipping a broken 2-char reply.
+    if not text or len(text.strip()) < 15:
         raise RuntimeError(f"empty response from {model}")
     finish_reason = getattr(r.choices[0], "finish_reason", None)
     truncated = finish_reason == "length"
@@ -239,8 +271,12 @@ async def _try_stream(client, model, messages, max_tokens, temperature, provider
             yield delta, None
     latency_ms = round((time.monotonic() - t0) * 1000)
     text = "".join(full_text)
-    if not started or not text.strip():
+    if not started or len(text.strip()) < 15:
         raise RuntimeError(f"empty stream from {model}")
+    # Can't un-send already-streamed tokens, but the *stored* text (session
+    # history, the final "done" event the UI re-renders from) comes from this
+    # cleaned version — see _strip_meta_narration's docstring.
+    text = _strip_meta_narration(text)
     logger.info(f"llm_stream provider={provider_name} model={model} latency_ms={latency_ms} chars={len(text)}")
     yield None, {"provider": provider_name, "model": model, "latency_ms": latency_ms, "text": text}
 

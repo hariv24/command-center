@@ -1317,12 +1317,12 @@ async function runBoard(){
 // monologues. Reuses the followup-stream endpoint with a canned prompt and a
 // tighter token cap (real disagreement fits in a few sentences).
 async function runDebateRound(){
-  const debateQ="What do you think of what the others just said? Push back by name if you disagree, or say plainly where you agree. Answer directly — don't restate this question or describe what you're about to do. Under 150 words.";
+  const debateQ="What do you think of what the others just said? Push back by name if you disagree, or say plainly where you agree. Answer directly — don't restate this question or describe what you're about to do. Hard limit: 100 words, 2-3 sentences. Stop there even mid-thought.";
   const {gridEl,synthSlot}=_liveTurnShell(boardConversation.length+1,'[Board deliberation round]',null);
   try{
     // Reuses the same abort controller runBoard() started (this only ever runs
     // from inside that call, before its finally clears it) — Stop cancels both.
-    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:debateQ,max_tokens:600},{gridEl,signal:_activeAbortController?.signal});
+    const collected=await _driveStream(`/api/board/${curSessId}/followup/stream`,{question:debateQ,max_tokens:1200},{gridEl,signal:_activeAbortController?.signal});
     const responses=collected.advisors.map(name=>{
       const r=collected.responses[name]||{};
       const info=AC[name]||{};
