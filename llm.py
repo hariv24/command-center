@@ -57,11 +57,6 @@ MODELS = {
 }
 
 
-def _is_rate_limit(e):
-    err = str(e).lower()
-    return any(s in err for s in ("rate_limit", "429", "quota", "limit reached", "tokens per"))
-
-
 def _openrouter_client():
     key = os.getenv("OPENROUTER_API_KEY")
     if not key:
@@ -140,6 +135,13 @@ async def _try(client, model, messages, max_tokens, temperature, provider_name, 
     t0 = time.monotonic()
     r = await client.chat.completions.create(**kwargs)
     latency_ms = round((time.monotonic() - t0) * 1000)
+    # A malformed/error response from a free model can come back with an empty
+    # or missing choices list (seen live: "'NoneType' object is not
+    # subscriptable" from indexing choices[0] directly) — treat that the same
+    # as an empty response so it falls through to the next model instead of
+    # throwing an unhandled TypeError that the caller doesn't expect.
+    if not getattr(r, "choices", None):
+        raise RuntimeError(f"no choices in response from {model}")
     text = r.choices[0].message.content
     if text:
         text = _THINK_RE.sub("", text)
@@ -318,8 +320,10 @@ async def stream_llm(messages, tier="heavy", max_tokens=900, temperature=0.85):
         for client in _groq_clients():
             yield client, MODELS["groq"][tier], "groq", False
 
+    # OpenRouter first for both tiers, matching call_llm — see its comment for
+    # why (1000/day budget, better free models, per-request billing).
     if provider == "openrouter":
-        sources = [_candidates_openrouter, _candidates_groq] if tier != "fast" else [_candidates_groq, _candidates_openrouter]
+        sources = [_candidates_openrouter, _candidates_groq]
     else:
         sources = [_candidates_groq, _candidates_openrouter]
 
@@ -329,10 +333,14 @@ async def stream_llm(messages, tier="heavy", max_tokens=900, temperature=0.85):
                 async for delta, meta in _try_stream(client, model, messages, max_tokens, temperature, provider_name, openrouter=is_or):
                     yield delta, meta
                 return  # stream completed successfully
-            except Exception as e:
-                if provider_name == "groq" and not _is_rate_limit(e):
-                    raise
-                continue  # try next candidate
+            except Exception:
+                # Any failure -> next candidate, then the non-streaming last
+                # resort below. This used to re-raise non-rate-limit Groq
+                # errors, aborting the whole generator instead of falling
+                # through — the same bug fixed in call_llm's _try_groq, just
+                # in the streaming path that every interactive board response
+                # actually goes through.
+                continue
 
     # Last resort — non-streaming call, emitted as a single chunk so callers
     # that only understand the streaming protocol still get an answer.

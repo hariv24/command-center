@@ -1040,7 +1040,7 @@ def vitals_chat():
         else:
             messages.append({"role": "user", "content": message})
 
-        return await call_llm(messages, tier="heavy", max_tokens=2000, temperature=0.8)
+        return await call_llm(messages, tier="heavy", max_tokens=2000, temperature=0.8, timeout=150)
 
     try:
         coach_response = _asyncio.run(_respond())

@@ -429,16 +429,31 @@ async def run_daily_brief_async():
     if goal_matched_keys:
         print(f"  Goal-matched categories: {', '.join(goal_matched_keys)}")
 
-    print(f"  Analyzing {len(story_map)} stories in parallel...")
+    print(f"  Analyzing {len(story_map)} stories one at a time...")
 
     full_profile = (profile + ("\n\n" + goals_ctx if goals_ctx else "")).strip()
 
-    analysis_tasks = [
-        analyze_story(story, cat, CATEGORIES[cat], idx + 1, full_profile, goal_match=cat in goal_matched_keys)
-        for idx, (cat, story) in enumerate(story_map.items())
-    ]
-    analyses = await asyncio.gather(*analysis_tasks)
-    board_verdict = await generate_board_verdict(story_map, full_profile)
+    # Sequential, not asyncio.gather(*analysis_tasks) — 7 concurrent heavy-tier
+    # calls (plus each one's own fallback-model retries) could burst well past
+    # OpenRouter's 20-requests/minute cap, and gather() without
+    # return_exceptions=True meant a single failed story took down the ENTIRE
+    # brief (no fallback text, no partial output — the whole cron run just
+    # failed). Now a failed story is skipped with a visible placeholder
+    # instead of silently killing every other story's analysis too.
+    analyses = []
+    for idx, (cat, story) in enumerate(story_map.items()):
+        try:
+            analysis = await analyze_story(story, cat, CATEGORIES[cat], idx + 1, full_profile, goal_match=cat in goal_matched_keys)
+        except Exception as e:
+            print(f"  [{cat}] analysis failed, skipping: {e}")
+            analysis = f"## [{cat}] {story['title']}\n\n*Analysis failed to generate for this story — source data is still linked above.*\n\nURL: {story['url']}"
+        analyses.append(analysis)
+
+    try:
+        board_verdict = await generate_board_verdict(story_map, full_profile)
+    except Exception as e:
+        print(f"  Board's Verdict failed, skipping: {e}")
+        board_verdict = "*Board's Verdict failed to generate today.*"
 
     date_str = datetime.now().strftime("%A, %B %d %Y")
     sections = [
