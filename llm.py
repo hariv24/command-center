@@ -184,13 +184,18 @@ async def call_llm(messages, tier="heavy", max_tokens=900, temperature=0.85, ret
         return None
 
     async def _try_groq():
+        # Any failure -> next groq key, then fall through to the next provider
+        # in `order` below. This used to re-raise non-rate-limit errors, which
+        # aborted the whole call_llm() attempt instead of falling through —
+        # defeating the fallback chain for anything that wasn't a recognized
+        # "rate_limit"/"429"/"quota" string (e.g. the empty/garbage-response
+        # check below, or any transient API hiccup). The docstring promises
+        # "raises only when every provider fails" — this makes that true.
         for client in _groq_clients():
             try:
                 return await _try(client, MODELS["groq"][tier], messages, max_tokens, temperature, "groq", timeout=timeout)
-            except Exception as e:
-                if _is_rate_limit(e):
-                    continue
-                raise
+            except Exception:
+                continue
         return None
 
     # Fast tier: Groq first — small token cost, rock-solid JSON compliance,
