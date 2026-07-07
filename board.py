@@ -903,9 +903,12 @@ async def run_followup_async(session_id, question, target_advisor=None):
         pass
 
     # Each advisor continues their own real conversation thread: full persona,
-    # full history as actual messages — no summaries, no truncation.
+    # full history as actual messages — no summaries, no truncation. One at a
+    # time (not asyncio.gather) — this is exactly the path that silently
+    # dropped an advisor mid-conversation when a concurrent burst hit
+    # OpenRouter's 20-requests/minute cap.
     prompts = {}
-    tasks = []
+    responses = []
     for name in advisors_for_turn:
         others = _others_context(session, name) if not target_advisor else ""
         prompt = _followup_prompt(name, question, others, anchor=anchor)
@@ -915,8 +918,7 @@ async def run_followup_async(session_id, question, target_advisor=None):
             + _get_thread(session, name)
             + [{"role": "user", "content": prompt}]
         )
-        tasks.append(_ask_advisor(name, BOARD[name], messages))
-    responses = await asyncio.gather(*tasks)
+        responses.append(await _ask_advisor(name, BOARD[name], messages))
 
     # Only synthesize when full board responds (not single-advisor turns)
     synthesis = None
@@ -1069,11 +1071,10 @@ async def run_debate_async(question):
     except Exception:
         pass
 
-    # Round 1 — both debaters answer independently, in parallel.
-    (result_a, prompt_a), (result_b, prompt_b) = await asyncio.gather(
-        _get_advisor_response(debater_a, BOARD[debater_a], question, profile, kb, anchor=anchor),
-        _get_advisor_response(debater_b, BOARD[debater_b], question, profile, kb, anchor=anchor),
-    )
+    # Round 1 — both debaters answer independently, one at a time (not
+    # asyncio.gather — same 20-req/minute reasoning as the board paths above).
+    result_a, prompt_a = await _get_advisor_response(debater_a, BOARD[debater_a], question, profile, kb, anchor=anchor)
+    result_b, prompt_b = await _get_advisor_response(debater_b, BOARD[debater_b], question, profile, kb, anchor=anchor)
     name_a, role_a, color_a, content_a, model_a = result_a
     name_b, role_b, color_b, content_b, model_b = result_b
 
@@ -1090,10 +1091,8 @@ async def run_debate_async(question):
         {"role": "assistant", "content": content_b},
         {"role": "user", "content": _rebuttal_prompt(debater_a, content_a, anchor=anchor)},
     ]
-    rebuttal_a, rebuttal_b = await asyncio.gather(
-        _ask_advisor(debater_a, BOARD[debater_a], messages_a),
-        _ask_advisor(debater_b, BOARD[debater_b], messages_b),
-    )
+    rebuttal_a = await _ask_advisor(debater_a, BOARD[debater_a], messages_a)
+    rebuttal_b = await _ask_advisor(debater_b, BOARD[debater_b], messages_b)
     rebuttal_content_a = rebuttal_a[3]
     rebuttal_content_b = rebuttal_b[3]
 
@@ -1144,14 +1143,17 @@ As the judge, rule on this debate in your own voice. Under 250 words:
         threads=threads,
     )
 
-    await asyncio.gather(
+    for coro in (
         _update_knowledge_base(question, verdict),
         _extract_recommendations(session_id, question, verdict, [debater_a, debater_b, judge_name]),
         _update_advisor_memory([debater_a, debater_b, judge_name]),
         _generate_session_title(session_id, question),
         _index_personal_rag(),
-        return_exceptions=True,
-    )
+    ):
+        try:
+            await coro
+        except Exception:
+            pass
 
     return {
         "session_id": session_id,
@@ -1200,11 +1202,14 @@ async def run_board_async(question):
     except Exception:
         pass
 
-    tasks = [
-        _get_advisor_response(name, config, question, profile, kb, anchor=anchor)
-        for name, config in selected_board.items()
-    ]
-    results = await asyncio.gather(*tasks)
+    # One advisor at a time, not asyncio.gather — a single board turn firing 4
+    # concurrent calls plus 5 more right after for KB/recs/memory/title/RAG
+    # routinely blew through OpenRouter's 20-requests/minute cap, silently
+    # dropping whichever advisor's call got 429'd (see the missing-Munger bug).
+    # Slower, but nothing gets silently cut.
+    results = []
+    for name, config in selected_board.items():
+        results.append(await _get_advisor_response(name, config, question, profile, kb, anchor=anchor))
     responses = [r for r, _prompt in results]
     synthesis = await _get_synthesis(question, responses)
 
@@ -1220,18 +1225,21 @@ async def run_board_async(question):
                                advisors=selected_names, advisor_reasons=advisor_reasons,
                                threads=threads)
 
-    # Awaited (not fire-and-forget): run_board is invoked via asyncio.run(), which tears
-    # down the event loop the instant this coroutine returns, cancelling any pending
-    # create_task() before it finishes. That silently dropped recommendations/KB/memory
-    # updates. gather here so they complete before the loop closes.
-    await asyncio.gather(
+    # Sequential here too, same rate-limit reasoning. Awaited rather than
+    # fire-and-forget — run_board is invoked via asyncio.run(), which tears
+    # down the event loop the instant this coroutine returns, cancelling any
+    # pending create_task() before it finishes.
+    for coro in (
         _update_knowledge_base(question, synthesis),
         _extract_recommendations(session_id, question, synthesis, selected_names),
         _update_advisor_memory(selected_names),
         _generate_session_title(session_id, question),
         _index_personal_rag(),
-        return_exceptions=True,
-    )
+    ):
+        try:
+            await coro
+        except Exception:
+            pass
 
     return {
         "session_id": session_id,
@@ -1283,9 +1291,12 @@ async def run_board_stream(question):
     except Exception:
         pass
 
+    # One advisor at a time — a full board turn used to fire all N advisors plus
+    # 5 more enrichment calls right after in quick succession, easily blowing
+    # through OpenRouter's 20-requests/minute cap and silently dropping
+    # whichever advisor's call got 429'd. Slower, but nothing gets cut.
     prompts = {}
-    queue = asyncio.Queue()
-    tasks = []
+    results = {}
     for name, config in selected_board.items():
         prompt = _opening_prompt(name, question, profile, kb, anchor=anchor)
         prompts[name] = prompt
@@ -1293,25 +1304,22 @@ async def run_board_stream(question):
             {"role": "system", "content": _build_system(name, config)},
             {"role": "user", "content": prompt},
         ]
-        tasks.append(asyncio.create_task(_stream_advisor_into_queue(queue, name, config, messages)))
-
-    results = {}
-    remaining = len(tasks)
-    while remaining > 0:
-        kind, name, payload = await queue.get()
-        if kind == "token":
-            yield {"event": "advisor_token", "advisor": name, "delta": payload}
-        elif kind == "error":
-            remaining -= 1
-            results[name] = ("", f"error:{payload}")
-            yield {"event": "error", "message": f"{name}: {payload}"}
-        elif kind == "done":
-            remaining -= 1
-            content, model = payload
-            results[name] = (content, model)
-            yield {"event": "advisor_done", "advisor": name, "content": content, "model": model}
-
-    await asyncio.gather(*tasks, return_exceptions=True)
+        queue = asyncio.Queue()
+        task = asyncio.create_task(_stream_advisor_into_queue(queue, name, config, messages))
+        while True:
+            kind, ev_name, payload = await queue.get()
+            if kind == "token":
+                yield {"event": "advisor_token", "advisor": ev_name, "delta": payload}
+            elif kind == "error":
+                results[name] = ("", f"error:{payload}")
+                yield {"event": "error", "message": f"{name}: {payload}"}
+                break
+            elif kind == "done":
+                content, model = payload
+                results[name] = (content, model)
+                yield {"event": "advisor_done", "advisor": name, "content": content, "model": model}
+                break
+        await task
 
     responses = [
         (name, selected_board[name]["role"], selected_board[name]["color"], content, model)
@@ -1340,17 +1348,21 @@ async def run_board_stream(question):
                                advisors=selected_names, advisor_reasons=advisor_reasons,
                                threads=threads)
 
-    # Awaited before the generator ends — app.py's _run_stream_generator closes its event
-    # loop right after this generator's StopAsyncIteration, which would cancel any pending
-    # fire-and-forget create_task() the same way the non-streaming path did (see run_board_async).
-    await asyncio.gather(
+    # Sequential, same rate-limit reasoning as the advisor loop above. Awaited
+    # before the generator ends — app.py's _run_stream_generator closes its
+    # event loop right after this generator's StopAsyncIteration, which would
+    # cancel any pending fire-and-forget create_task() otherwise.
+    for coro in (
         _update_knowledge_base(question, synthesis),
         _extract_recommendations(session_id, question, synthesis, selected_names),
         _update_advisor_memory(selected_names),
         _generate_session_title(session_id, question),
         _index_personal_rag(),
-        return_exceptions=True,
-    )
+    ):
+        try:
+            await coro
+        except Exception:
+            pass
 
     yield {"event": "done", "session_id": session_id, "synthesis": synthesis}
 
@@ -1387,10 +1399,13 @@ async def run_followup_stream(session_id, question, target_advisor=None, max_tok
     except Exception:
         pass
 
+    # One advisor at a time — this is the exact path that dropped an advisor
+    # mid-conversation when a concurrent burst hit OpenRouter's 20/minute cap
+    # (multiple advisors + background enrichment calls firing in the same
+    # few seconds). Slower, but nothing gets silently cut anymore.
     prior_turns = session.get("turns", [])
     prompts = {}
-    queue = asyncio.Queue()
-    tasks = []
+    results = {}
     for name in advisors_for_turn:
         others = _others_context(session, name) if not target_advisor else ""
         prompt = _followup_prompt(name, question, others, anchor=anchor)
@@ -1400,25 +1415,22 @@ async def run_followup_stream(session_id, question, target_advisor=None, max_tok
             + _get_thread(session, name)
             + [{"role": "user", "content": prompt}]
         )
-        tasks.append(asyncio.create_task(_stream_advisor_into_queue(queue, name, BOARD[name], messages, max_tokens=max_tokens)))
-
-    results = {}
-    remaining = len(tasks)
-    while remaining > 0:
-        kind, name, payload = await queue.get()
-        if kind == "token":
-            yield {"event": "advisor_token", "advisor": name, "delta": payload}
-        elif kind == "error":
-            remaining -= 1
-            results[name] = ("", f"error:{payload}")
-            yield {"event": "error", "message": f"{name}: {payload}"}
-        elif kind == "done":
-            remaining -= 1
-            content, model = payload
-            results[name] = (content, model)
-            yield {"event": "advisor_done", "advisor": name, "content": content, "model": model}
-
-    await asyncio.gather(*tasks, return_exceptions=True)
+        queue = asyncio.Queue()
+        task = asyncio.create_task(_stream_advisor_into_queue(queue, name, BOARD[name], messages, max_tokens=max_tokens))
+        while True:
+            kind, ev_name, payload = await queue.get()
+            if kind == "token":
+                yield {"event": "advisor_token", "advisor": ev_name, "delta": payload}
+            elif kind == "error":
+                results[name] = ("", f"error:{payload}")
+                yield {"event": "error", "message": f"{name}: {payload}"}
+                break
+            elif kind == "done":
+                content, model = payload
+                results[name] = (content, model)
+                yield {"event": "advisor_done", "advisor": name, "content": content, "model": model}
+                break
+        await task
 
     responses = [
         (name, BOARD[name]["role"], BOARD[name]["color"], content, model)

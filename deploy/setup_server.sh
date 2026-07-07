@@ -64,7 +64,7 @@ After=network.target
 Type=simple
 User=ubuntu
 WorkingDirectory=${APP_DIR}
-ExecStart=${APP_DIR}/venv/bin/gunicorn --bind 0.0.0.0:4000 --workers 2 --timeout 180 app:app
+ExecStart=${APP_DIR}/venv/bin/gunicorn --bind 0.0.0.0:4000 --workers 2 --timeout 600 app:app
 Restart=always
 RestartSec=3
 MemoryMax=1536M
@@ -102,10 +102,18 @@ else
   echo "TELEGRAM_BOT_TOKEN not set in .env — ccbot service enabled but not started this run"
 fi
 
-echo "== 6/7: gunicorn threads for SSE streaming =="
-# The board/followup streaming endpoints hold connections open for 1-2 min;
-# a single sync worker would block all other requests during that window.
-sudo sed -i 's/--workers 2 --timeout 180/--workers 2 --threads 4 --timeout 180/' /etc/systemd/system/commandcenter.service
+echo "== 6/7: gunicorn threads + timeout for SSE streaming =="
+# The board/followup streaming endpoints now run advisors one at a time
+# instead of concurrently (avoids bursting past OpenRouter's 20-req/minute
+# cap), so a full multi-advisor session can legitimately take several
+# minutes — 600s gives real headroom instead of gunicorn killing the worker
+# mid-session. A single sync worker would also block all other requests
+# during that window, hence --threads. Both seds are idempotent regardless
+# of what a previous run of this script already left in place.
+sudo sed -i -E 's/--timeout [0-9]+/--timeout 600/' /etc/systemd/system/commandcenter.service
+if ! grep -q -- '--threads' /etc/systemd/system/commandcenter.service; then
+  sudo sed -i 's/--workers 2/--workers 2 --threads 4/' /etc/systemd/system/commandcenter.service
+fi
 sudo systemctl daemon-reload
 sudo systemctl restart commandcenter
 
