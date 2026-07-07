@@ -453,7 +453,14 @@ def board_followup_stream(session_id):
     data = request.get_json()
     question = data.get("question", "").strip()
     target_advisor = data.get("advisor") or None
-    max_tokens = int(data.get("max_tokens", 900))
+    # Was defaulting to 900 whenever the caller didn't send max_tokens explicitly —
+    # which is every regular follow-up from the UI (submitFollowup() never sends
+    # it). run_followup_stream's own real default is 3600; 900 was silently
+    # capping every normal follow-up answer and truncating it mid-sentence. Only
+    # the deliberation round and debate mode need a tighter cap, and they already
+    # pass max_tokens explicitly (600/1200), so this fallback should match the
+    # function's real default, not override it down.
+    max_tokens = int(data.get("max_tokens", 3600))
     if not question:
         return jsonify({"error": "Question is required"}), 400
 
