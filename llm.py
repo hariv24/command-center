@@ -27,7 +27,14 @@ TOGETHER_BASE_URL = "https://api.together.xyz/v1"
 MODELS = {
     "openrouter": {
         "heavy": os.getenv("LLM_MODEL_HEAVY", "nvidia/nemotron-3-ultra-550b-a55b:free"),
-        "fast": os.getenv("LLM_MODEL_FAST", "openai/gpt-oss-20b:free"),
+        # gpt-oss-20b spends nearly its whole token budget on hidden reasoning
+        # even with reasoning.exclude set (measured: 47 of 50 max_tokens on a
+        # trivial prompt), so it reliably returns empty content on the low
+        # max_tokens fast-tier calls use for routing/extraction. nemotron-3-nano
+        # has the same reasoning overhead but actually finishes (finish_reason
+        # "stop", not "length") and matches the nemotron-3 family already used
+        # for the heavy tier.
+        "fast": os.getenv("LLM_MODEL_FAST", "nvidia/nemotron-3-nano-30b-a3b:free"),
         # Tried in order if the tier model errors (removed model, upstream 429...)
         "heavy_backups": [
             "nousresearch/hermes-3-llama-3.1-405b:free",
@@ -198,11 +205,15 @@ async def call_llm(messages, tier="heavy", max_tokens=900, temperature=0.85, ret
                 continue
         return None
 
-    # Fast tier: Groq first — small token cost, rock-solid JSON compliance,
-    # and it keeps OpenRouter's daily request budget for heavy advisor calls.
-    # Heavy tier: OpenRouter first — far stronger free models, per-request billing.
+    # OpenRouter first for both tiers — stronger free models, a 1000/day budget
+    # (vs Groq's much tighter free-tier caps), and per-request rather than
+    # per-token billing. Fast tier used to try Groq first on the theory that it
+    # kept OpenRouter's daily budget free for heavy advisor calls, but at
+    # 1000/day that headroom doesn't matter, and it meant every board turn's
+    # routing/synthesis/extraction calls were burning Groq's tighter budget
+    # for no real benefit. Groq is now purely the fallback for both tiers.
     if provider == "openrouter":
-        order = [_try_groq, _try_openrouter] if tier == "fast" else [_try_openrouter, _try_groq]
+        order = [_try_openrouter, _try_groq]
     else:
         order = [_try_groq, _try_openrouter]
     for attempt in order:
